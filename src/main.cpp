@@ -2,14 +2,28 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <algorithm>
 #include <cmath>
-#include <limits>
+#include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace geode::prelude;
 
+// ===========================================================================
+// AutoBot v0.3 - lookahead planner.
+//
+// Instead of "click when a spike is near", every frame the bot copies the
+// player's state into a small physics simulator, tries many hold/release
+// sequences for the next ~0.8 s (beam search), throws away every sequence that
+// crashes, and picks the one that stays furthest from danger. It then applies
+// only the first action and re-plans next frame.
+//
+// That is what lets it land ON blocks (the sim knows a block top is a floor and
+// a block side is a wall), time pads/orbs, and thread the ship through gaps.
+// ===========================================================================
+
 // ---------------------------------------------------------------------------
-// Gamemode detection: the player object exposes flags, so no icon guessing.
+// Gamemode detection
 // ---------------------------------------------------------------------------
 enum class Mode { Cube, Ship, Ball, UFO, Wave, Robot, Spider, Swing };
 
@@ -42,58 +56,381 @@ static bool supported(Mode m) {
 	return m == Mode::Cube || m == Mode::Robot || m == Mode::Ship;
 }
 
-// Orb object IDs: yellow, blue (gravity), pink, green, black, red.
-static bool isOrbId(int id) {
-	return id == 36 || id == 84 || id == 141 || id == 1022 || id == 1330 || id == 1333;
+// ---------------------------------------------------------------------------
+// Physics constants. Units are "level units per 1/60 s frame".
+// These come from community research and may be slightly off: the HUD shows
+// the prediction error so you can tune them (see the notes in the chat).
+// ---------------------------------------------------------------------------
+constexpr float BASE_SPEED = 311.58f;   // units/s at normal speed
+namespace phys {
+	constexpr float HALF = 15.f;            // player half size (30x30 hitbox)
+	constexpr float GRAVITY = 0.958199f;    // cube gravity per frame^2
+	constexpr float JUMP = 11.180032f;      // cube jump velocity
+	constexpr float FALL_MAX = 15.f;        // cube terminal velocity
+	constexpr float STEP = 0.5f;            // frames per substep
+	constexpr int SUBSTEPS = 2;             // substeps per planned frame
+	constexpr float SPEEDS[5] = {251.16f, 311.58f, 387.42f, 468.0f, 576.0f};
 }
 
-// Base horizontal speed at 1x in units per second (multiplied by m_playerSpeed).
-constexpr float BASE_SPEED = 311.58f;
+// ---------------------------------------------------------------------------
+// Geometry helpers
+// ---------------------------------------------------------------------------
+struct Rc { float x0, y0, x1, y1; };
 
-struct Orb {
-	CCRect rect;
-	bool used = false;
+static Rc toRc(CCRect const& r) {
+	return {r.getMinX(), r.getMinY(), r.getMaxX(), r.getMaxY()};
+}
+// Mirror vertically when gravity is flipped, so the sim always works "y-up".
+static inline Rc mir(Rc const& r, float sgn) {
+	return sgn > 0.f ? r : Rc{r.x0, -r.y1, r.x1, -r.y0};
+}
+static inline bool hit(Rc const& a, Rc const& b) {
+	return a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
+}
+
+// ---------------------------------------------------------------------------
+// Level objects the bot cares about.
+//
+// Obstacle / interactable categories (everything else is decoration or a
+// trigger and is ignored):
+//   HAZARD  - spikes (all sizes), saw blades, thorns, any "deadly" object
+//   SOLID   - blocks / platforms: land on top, die on the sides, bonk underside
+//   ORB     - rings: need a click while touching (yellow, pink, red here)
+//   PAD     - jump pads: fire automatically on touch (yellow, pink, red here)
+//   PORTAL  - mode (cube/ship), gravity up/down, and speed portals
+// Not handled yet: slopes, blue/green/black orbs, blue pads, ball/UFO/wave/
+// robot/spider/swing portals, dual mode, mini size, moving objects.
+// ---------------------------------------------------------------------------
+enum Kind : uint8_t { K_SOLID, K_HAZARD, K_ORB, K_PAD, K_PORTAL };
+
+struct Obj {
+	Rc r;
+	Kind k;
+	int id = 0;
+	int ix = -1;        // slot in the sim's "already triggered" bitmask
+	bool used = false;  // orb/pad/portal already consumed in the real game
 };
 
+static bool isOrbId(int id)    { return id == 36 || id == 141 || id == 1333; }
+static bool isPadId(int id)    { return id == 35 || id == 140 || id == 1332; }
+static bool isPortalId(int id) {
+	switch (id) {
+		case 10: case 11:                        // gravity normal / inverted
+		case 12: case 13:                        // cube / ship
+		case 200: case 201: case 202: case 203: case 1334: // speeds
+			return true;
+	}
+	return false;
+}
+static float padVel(int id) { return id == 35 ? 16.f : (id == 140 ? 10.4f : 20.f); }
+static float orbVel(int id) { return id == 36 ? 11.18f : (id == 141 ? 7.2f : 14.5f); }
+
+// ---------------------------------------------------------------------------
+// Simulator
+// ---------------------------------------------------------------------------
+struct Sim {
+	float x = 0.f;
+	float y = 0.f;       // normalized: gravity always pulls toward -y
+	float vy = 0.f;      // normalized as well
+	float sgn = 1.f;     // +1 normal gravity, -1 flipped
+	float speed = BASE_SPEED;
+	bool ship = false;
+	bool ground = false;
+	bool held = false;
+	uint64_t mask = 0;   // interactables already triggered
+};
+
+struct Env {
+	std::vector<Obj> loc;   // objects near the player, sorted by x0
+	float floorY = 90.f;
+	float ceilY = 390.f;
+	float aUp = 0.8f, aDown = 0.8f;  // ship acceleration (frames^-2), learned live
+	float vUp = 8.f, vDown = 6.4f;   // ship velocity limits, learned live
+	float margin = 2.f;              // hazard inflation = safety margin
+	bool useOrbs = true;
+};
+
+static inline Rc box(Sim const& s, float h) {
+	return {s.x - h, s.y - h, s.x + h, s.y + h};
+}
+
+static void flipGravity(Sim& s) {
+	s.sgn = -s.sgn;
+	s.y = -s.y;
+	s.vy = -s.vy;
+}
+
+static void applyPortal(Sim& s, int id) {
+	switch (id) {
+		case 12: s.ship = false; break;
+		case 13: s.ship = true; break;
+		case 10: if (s.sgn < 0.f) flipGravity(s); break;
+		case 11: if (s.sgn > 0.f) flipGravity(s); break;
+		case 200: s.speed = phys::SPEEDS[0]; break;
+		case 201: s.speed = phys::SPEEDS[1]; break;
+		case 202: s.speed = phys::SPEEDS[2]; break;
+		case 203: s.speed = phys::SPEEDS[3]; break;
+		case 1334: s.speed = phys::SPEEDS[4]; break;
+	}
+}
+
+// Advance one 1/60 s frame with the button held (or not). false = crashed.
+static bool stepFrame(Sim& s, bool hold, Env const& e) {
+	using namespace phys;
+	bool edge = hold && !s.held;   // a fresh press: the only thing orbs react to
+	s.held = hold;
+
+	for (int i = 0; i < SUBSTEPS; ++i) {
+		s.x += s.speed * (STEP / 60.f);
+		float py = s.y;
+		bool canJump = s.ground;
+		s.ground = false;
+
+		if (s.ship) {
+			float a = hold ? e.aUp : -e.aDown;
+			s.vy = std::clamp(s.vy + a * STEP, -e.vDown, e.vUp);
+		} else {
+			if (canJump && hold) s.vy = JUMP;       // also re-jumps if held on landing
+			s.vy = std::max(s.vy - GRAVITY * STEP, -FALL_MAX);
+		}
+		s.y += s.vy * STEP;
+
+		Rc pr = box(s, HALF);
+		for (auto const& o : e.loc) {
+			if (o.r.x1 < s.x - 20.f) continue;
+			if (o.r.x0 > s.x + 20.f) break;
+			Rc r = mir(o.r, s.sgn);
+
+			if (o.k == K_HAZARD) {
+				Rc h{r.x0 - e.margin, r.y0 - e.margin, r.x1 + e.margin, r.y1 + e.margin};
+				if (hit(pr, h)) return false;
+			} else if (o.k == K_SOLID) {
+				if (!hit(pr, r)) continue;
+				if (py - HALF >= r.y1 - 3.f && s.vy <= 0.f) {        // landed on top
+					s.y = r.y1 + HALF;
+					s.vy = 0.f;
+					s.ground = true;
+				} else if (py + HALF <= r.y0 + 3.f && s.vy >= 0.f) { // bonked underside
+					s.y = r.y0 - HALF;
+					s.vy = 0.f;
+				} else {
+					return false;                                    // hit a wall
+				}
+				pr = box(s, HALF);
+			} else {
+				if (o.ix < 0 || ((s.mask >> o.ix) & 1ull) || !hit(pr, r)) continue;
+				uint64_t bit = 1ull << o.ix;
+				if (o.k == K_PAD) {
+					if (!s.ship) { s.vy = padVel(o.id); s.ground = false; s.mask |= bit; }
+				} else if (o.k == K_ORB) {
+					if (!s.ship && edge && e.useOrbs) {
+						s.vy = orbVel(o.id);
+						s.ground = false;
+						s.mask |= bit;
+						edge = false;
+					}
+				} else { // portal
+					float before = s.sgn;
+					applyPortal(s, o.id);
+					s.mask |= bit;
+					if (before != s.sgn) { py = -py; pr = box(s, HALF); }
+				}
+			}
+		}
+
+		// Floor / ceiling (in normalized space).
+		float fl = s.sgn > 0.f ? e.floorY : -e.ceilY;
+		float ce = s.sgn > 0.f ? e.ceilY : -e.floorY;
+		if (s.y - HALF <= fl) {
+			s.y = fl + HALF;
+			if (s.vy < 0.f) s.vy = 0.f;
+			s.ground = true;
+		}
+		if (s.ship && s.y + HALF >= ce) {
+			s.y = ce - HALF;
+			if (s.vy > 0.f) s.vy = 0.f;
+		}
+	}
+	return true;
+}
+
+// How far (in units) the player is from the nearest thing that could hurt it.
+// Hazards always count; solids and the floor/ceiling only count for the ship,
+// because a cube standing on a block is *supposed* to touch it.
+static float clearance(Sim const& s, Env const& e) {
+	float c = 30.f;
+	Rc pr = box(s, phys::HALF);
+	for (auto const& o : e.loc) {
+		if (o.r.x1 < s.x - 50.f) continue;
+		if (o.r.x0 > s.x + 50.f) break;
+		if (!(o.k == K_HAZARD || (s.ship && o.k == K_SOLID))) continue;
+		Rc r = mir(o.r, s.sgn);
+		float dx = std::max({r.x0 - pr.x1, pr.x0 - r.x1, 0.f});
+		float dy = std::max({r.y0 - pr.y1, pr.y0 - r.y1, 0.f});
+		c = std::min(c, std::max(dx, dy));
+	}
+	if (s.ship) {
+		float fl = s.sgn > 0.f ? e.floorY : -e.ceilY;
+		float ce = s.sgn > 0.f ? e.ceilY : -e.floorY;
+		c = std::min(c, std::min(s.y - phys::HALF - fl, ce - (s.y + phys::HALF)));
+	}
+	return std::max(c, 0.f);
+}
+
+static bool touchingOrb(Sim const& s, Env const& e) {
+	Rc pr = box(s, phys::HALF);
+	for (auto const& o : e.loc) {
+		if (o.r.x1 < s.x - 20.f) continue;
+		if (o.r.x0 > s.x + 20.f) break;
+		if (o.k != K_ORB || o.ix < 0 || ((s.mask >> o.ix) & 1ull)) continue;
+		if (hit(pr, mir(o.r, s.sgn))) return true;
+	}
+	return false;
+}
+
+// ---------------------------------------------------------------------------
+// Beam search over hold/release sequences
+// ---------------------------------------------------------------------------
+struct BeamNode {
+	Sim s;
+	float clr = 30.f;      // worst clearance along this path
+	int toggles = 0;
+	int holds = 0;
+	int first = -1;        // first action of this path
+	float y1 = 0.f;        // predicted world y after the first frame
+	uint64_t acts = 0;     // action bitmask, bit i = frame i
+};
+
+struct Plan {
+	bool hold = false;
+	int alive = 0;         // frames the best path survived
+	float y1 = 0.f;
+	uint64_t acts = 0;
+};
+
+static float scoreOf(BeamNode const& n) {
+	// Bigger worst-case clearance first (this centres jumps and ship paths),
+	// then fewer clicks, and wait rather than click early when it is a tie.
+	return std::floor(n.clr) * 100.f - n.toggles * 6.f - n.holds * 0.2f
+	     - (n.first == 1 ? 1.f : 0.f);
+}
+
+static uint64_t keyOf(Sim const& s) {
+	uint64_t h = 1469598103934665603ull;
+	auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
+	mix((uint32_t)(int32_t)std::lround(s.y * 1.5f));
+	mix((uint32_t)(int32_t)std::lround(s.vy * 2.f));
+	mix((s.ground ? 1u : 0u) | (s.held ? 2u : 0u) | (s.ship ? 4u : 0u) | (s.sgn > 0.f ? 8u : 0u));
+	mix(s.mask);
+	mix((uint32_t)(int32_t)std::lround(s.speed));
+	return h;
+}
+
+static Plan search(Sim const& start, Env const& e, int H, int W) {
+	static std::vector<BeamNode> cur, nxt;
+	static std::unordered_map<uint64_t, size_t> seen;
+	cur.clear();
+	BeamNode root;
+	root.s = start;
+	cur.push_back(root);
+
+	BeamNode best = root;
+	int depth = 0;
+
+	for (int f = 0; f < H; ++f) {
+		nxt.clear();
+		seen.clear();
+		for (auto const& n : cur) {
+			// Cube: only ground / orb frames offer a real choice.
+			bool both = n.s.ship || n.s.ground || touchingOrb(n.s, e);
+			for (int a = 0; a < (both ? 2 : 1); ++a) {
+				BeamNode m = n;
+				if (!stepFrame(m.s, a == 1, e)) continue;
+				m.clr = std::min(m.clr, clearance(m.s, e));
+				if ((a == 1) != n.s.held) ++m.toggles;
+				if (a == 1) ++m.holds;
+				if (f == 0) { m.first = a; m.y1 = m.s.y * m.s.sgn; }
+				m.acts |= (uint64_t)a << f;
+
+				uint64_t key = keyOf(m.s);
+				auto it = seen.find(key);
+				if (it == seen.end()) {
+					seen[key] = nxt.size();
+					nxt.push_back(m);
+				} else if (scoreOf(m) > scoreOf(nxt[it->second])) {
+					nxt[it->second] = m;
+				}
+			}
+		}
+		if (nxt.empty()) break; // every path crashed; keep the longest survivor
+		std::sort(nxt.begin(), nxt.end(), [](BeamNode const& a, BeamNode const& b) {
+			return scoreOf(a) > scoreOf(b);
+		});
+		if ((int)nxt.size() > W) nxt.resize(W);
+		cur.swap(nxt);
+		best = cur[0];
+		depth = f + 1;
+	}
+
+	Plan p;
+	p.alive = depth;
+	p.hold = best.first == 1;
+	p.y1 = best.y1;
+	p.acts = best.acts;
+	return p;
+}
+
+// ===========================================================================
+// The mod
+// ===========================================================================
 class $modify(BotPlayLayer, PlayLayer) {
 	struct Fields {
-		std::vector<CCRect> hazards;  // sorted by minX
-		std::vector<CCRect> solids;   // sorted by minX
-		std::vector<Orb> orbs;        // sorted by minX
+		std::vector<Obj> objs;   // sorted by x0
 		bool holding = false;
-		int pulse = 0;                // frames left on an orb click
+		bool pressedLast = false;
 		int clicks = 0;
+
+		// telemetry
+		float prevX = -1.f, prevY = 0.f, prevVN = 0.f;
+		Mode prevMode = Mode::Cube;
+		float speed = BASE_SPEED;
+
+		// ship parameters learned while flying
+		float aUp = 0.8f, aDown = 0.8f, vUp = 8.f, vDown = 6.4f;
+		float floorY = 90.f;
+
+		// planner readout
+		bool havePred = false;
+		float predY = 0.f;
+		float err = 0.f;
+		int alive = 0;
+
 		CCDrawNode* debug = nullptr;
 		CCLabelBMFont* hud = nullptr;
 	};
 
-	// Build the object caches once the level has finished loading.
 	void setupHasCompleted() {
 		PlayLayer::setupHasCompleted();
 
 		auto& f = m_fields;
-		f->hazards.clear();
-		f->solids.clear();
-		f->orbs.clear();
-
+		f->objs.clear();
 		if (m_objects) {
 			for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
-				if (obj->m_objectType == GameObjectType::Hazard) {
-					f->hazards.push_back(obj->getObjectRect());
-				} else if (obj->m_objectType == GameObjectType::Solid) {
-					f->solids.push_back(obj->getObjectRect());
-				} else if (isOrbId(obj->m_objectID)) {
-					f->orbs.push_back(Orb{obj->getObjectRect(), false});
-				}
+				int id = obj->m_objectID;
+				Obj o;
+				o.id = id;
+				o.r = toRc(obj->getObjectRect());
+				if (isPortalId(id))                                  o.k = K_PORTAL;
+				else if (isOrbId(id))                                o.k = K_ORB;
+				else if (isPadId(id))                                o.k = K_PAD;
+				else if (obj->m_objectType == GameObjectType::Hazard) o.k = K_HAZARD;
+				else if (obj->m_objectType == GameObjectType::Solid)  o.k = K_SOLID;
+				else continue;
+				f->objs.push_back(o);
 			}
 		}
-		auto byX = [](CCRect const& a, CCRect const& b) {
-			return a.getMinX() < b.getMinX();
-		};
-		std::sort(f->hazards.begin(), f->hazards.end(), byX);
-		std::sort(f->solids.begin(), f->solids.end(), byX);
-		std::sort(f->orbs.begin(), f->orbs.end(), [](Orb const& a, Orb const& b) {
-			return a.rect.getMinX() < b.rect.getMinX();
+		std::sort(f->objs.begin(), f->objs.end(), [](Obj const& a, Obj const& b) {
+			return a.r.x0 < b.r.x0;
 		});
 
 		f->debug = CCDrawNode::create();
@@ -111,133 +448,160 @@ class $modify(BotPlayLayer, PlayLayer) {
 	void resetLevel() {
 		PlayLayer::resetLevel();
 		auto& f = m_fields;
-		for (auto& o : f->orbs) o.used = false;
+		for (auto& o : f->objs) o.used = false;
 		f->holding = false;
-		f->pulse = 0;
+		f->pressedLast = false;
+		f->prevX = -1.f;
+		f->havePred = false;
 	}
 
-	// Runs every frame after the game's own update.
 	void postUpdate(float dt) {
 		PlayLayer::postUpdate(dt);
 
 		auto mod = Mod::get();
+		auto& f = m_fields;
+		auto p = m_player1;
+		Mode mode = getMode(p);
+
 		bool on = mod->getSettingValue<bool>("enabled");
 		if (mod->getSettingValue<bool>("practice-only") && !m_isPracticeMode) on = false;
-		if (!on || m_player1->m_isDead) {
+		if (!on || p->m_isDead) {
 			release();
-			updateHud(false, getMode(m_player1));
+			f->prevX = -1.f;
+			f->havePred = false;
+			if (f->debug) f->debug->clear();
+			updateHud(false, mode);
 			return;
 		}
 
-		Mode mode = getMode(m_player1);
-		bool want = false;
-
-		switch (mode) {
-			case Mode::Cube:
-			case Mode::Robot: // robot hold length is not handled yet
-				want = decideCube();
-				break;
-			case Mode::Ship:
-				want = decideShip();
-				break;
-			default: // TODO: UFO, Wave, Ball, Spider, Swing
-				want = false;
-				break;
-		}
-
-		// Orbs (cube/robot/ship only for now).
-		if (supported(mode) && mod->getSettingValue<bool>("use-orbs")) {
-			if (checkOrbs()) m_fields->pulse = 3;
-		}
-		if (m_fields->pulse > 0) {
-			--m_fields->pulse;
-			want = true;
-		}
-
-		setHold(want);
-		updateHud(true, mode);
-		drawDebug();
-	}
-
-	// ---- Controllers ------------------------------------------------------
-
-	// Cube: click when a hazard's hitbox is about to enter the jump window.
-	// Approximation, NOT a physics simulation yet.
-	bool decideCube() {
-		auto p = m_player1;
-		if (!p->m_isOnGround) return false;
-
-		float speed = BASE_SPEED * p->m_playerSpeed;
-		float lead = static_cast<float>(Mod::get()->getSettingValue<double>("lead-time"));
-		float window = speed * lead;
-
 		auto pos = p->getPosition();
-		for (auto const& r : m_fields->hazards) {
-			if (r.getMaxX() < pos.x) continue;
-			if (r.getMinX() - pos.x > window) break;
-			if (std::abs(r.getMidY() - pos.y) < 45.f) return true;
-		}
-		return false;
-	}
+		float sgn = p->m_isUpsideDown ? -1.f : 1.f;
 
-	// Ship: find the floor and ceiling just ahead, then hold/release to steer
-	// toward the middle of the gap (or hold altitude if there is no gap).
-	bool decideShip() {
-		auto p = m_player1;
-		auto pos = p->getPosition();
-		float speed = BASE_SPEED * p->m_playerSpeed;
-		float look = speed * 0.35f;
+		// ---- telemetry --------------------------------------------------
+		bool fresh = f->prevX < 0.f;
+		float v = static_cast<float>(p->m_yVelocity);
+		if (!fresh && (pos.y - f->prevY) * v < -0.05f) v = -v; // sign convention guard
+		float vN = v * sgn;
 
-		constexpr float NONE = std::numeric_limits<float>::infinity();
-		float floorY = -NONE;
-		float ceilY = NONE;
-
-		auto scan = [&](std::vector<CCRect> const& v) {
-			for (auto const& r : v) {
-				if (r.getMaxX() < pos.x - 15.f) continue;
-				if (r.getMinX() - pos.x > look) break;
-				if (r.getMidY() < pos.y) floorY = std::max(floorY, r.getMaxY());
-				else ceilY = std::min(ceilY, r.getMinY());
+		if (fresh) {
+			f->speed = BASE_SPEED * static_cast<float>(p->m_playerSpeed);
+		} else if (dt > 1e-4f) {
+			// Measure the real speed and snap it to the nearest known speed.
+			float sp = (pos.x - f->prevX) / dt;
+			for (float t : phys::SPEEDS) {
+				if (std::abs(sp - t) < t * 0.06f) { f->speed = t; break; }
 			}
+			// Prediction error of last frame's plan (world y, in units).
+			if (f->havePred && dt > 0.010f && dt < 0.025f) f->err = pos.y - f->predY;
+
+			// Learn ship acceleration/limits from what the game actually does.
+			if (mode == Mode::Ship && f->prevMode == Mode::Ship && !p->m_isOnGround
+				&& dt > 0.008f && dt < 0.03f) {
+				float a = (vN - f->prevVN) / (dt * 60.f);
+				bool saturated = vN >= f->vUp - 0.05f || vN <= -f->vDown + 0.05f;
+				if (!saturated && std::abs(a) < 3.f) {
+					if (f->holding && a > 0.05f)   f->aUp   += (a - f->aUp) * 0.1f;
+					if (!f->holding && a < -0.05f) f->aDown += (-a - f->aDown) * 0.1f;
+				}
+				f->vUp   = std::min(12.f, std::max(f->vUp, vN));
+				f->vDown = std::min(12.f, std::max(f->vDown, -vN));
+			}
+		}
+		f->havePred = false;
+
+		// Binary search helper into the sorted object list.
+		auto lowerIt = [&](float x0) {
+			return std::lower_bound(f->objs.begin(), f->objs.end(), x0,
+				[](Obj const& o, float v2) { return o.r.x0 < v2; });
 		};
-		scan(m_fields->solids);
-		scan(m_fields->hazards);
 
-		float target;
-		bool hasFloor = floorY > -NONE;
-		bool hasCeil = ceilY < NONE;
-		if (hasFloor && hasCeil) target = (floorY + ceilY) * 0.5f;
-		else if (hasFloor)       target = floorY + 45.f;
-		else if (hasCeil)        target = ceilY - 45.f;
-		else                     target = pos.y;
+		// Learn the ship floor when the ship is resting on the real floor
+		// (not on a block).
+		if (mode == Mode::Ship && p->m_isOnGround && sgn > 0.f) {
+			Rc below{pos.x - 14.f, pos.y - 19.f, pos.x + 14.f, pos.y - 14.5f};
+			bool block = false;
+			for (auto it = lowerIt(pos.x - 200.f); it != f->objs.end() && it->r.x0 < pos.x + 40.f; ++it) {
+				if (it->k == K_SOLID && hit(below, it->r)) { block = true; break; }
+			}
+			if (!block) f->floorY = pos.y - phys::HALF;
+		}
 
-		float predicted = pos.y + static_cast<float>(p->m_yVelocity) * 0.1f;
-		bool rise = predicted < target;
-		return p->m_isUpsideDown ? !rise : rise;
-	}
-
-	// True once when the player first touches an unused orb.
-	bool checkOrbs() {
-		auto pr = m_player1->getObjectRect();
-		float px = m_player1->getPositionX();
-		for (auto& o : m_fields->orbs) {
-			if (o.rect.getMaxX() < px - 40.f) continue;
-			if (o.rect.getMinX() > px + 40.f) break;
-			if (!o.used && pr.intersectsRect(o.rect)) {
-				o.used = true;
-				return true;
+		// Mark pads/portals we are touching, and orbs we just clicked, as used.
+		{
+			Rc pr{pos.x - 15.f, pos.y - 15.f, pos.x + 15.f, pos.y + 15.f};
+			for (auto it = lowerIt(pos.x - 200.f); it != f->objs.end() && it->r.x0 < pos.x + 40.f; ++it) {
+				if (it->used || !hit(pr, it->r)) continue;
+				if (it->k == K_PAD || it->k == K_PORTAL) it->used = true;
+				else if (it->k == K_ORB && f->pressedLast) it->used = true;
 			}
 		}
-		return false;
+		f->pressedLast = false;
+
+		f->prevX = pos.x;
+		f->prevY = pos.y;
+		f->prevVN = vN;
+		f->prevMode = mode;
+
+		// ---- plan ----------------------------------------------------------
+		if (!supported(mode)) {
+			release();
+			if (f->debug) f->debug->clear();
+			updateHud(true, mode);
+			return;
+		}
+
+		int H = std::clamp<int>(static_cast<int>(mod->getSettingValue<int64_t>("horizon")), 10, 62);
+		int W = std::clamp<int>(static_cast<int>(mod->getSettingValue<int64_t>("beam-width")), 8, 400);
+
+		Env env;
+		env.floorY = f->floorY;
+		env.ceilY = f->floorY + 300.f;
+		env.aUp = f->aUp; env.aDown = f->aDown;
+		env.vUp = f->vUp; env.vDown = f->vDown;
+		env.margin = static_cast<float>(mod->getSettingValue<double>("hazard-margin"));
+		env.useOrbs = mod->getSettingValue<bool>("use-orbs");
+
+		Sim s0;
+		s0.x = pos.x;
+		s0.sgn = sgn;
+		s0.y = pos.y * sgn;
+		s0.vy = vN;
+		s0.speed = f->speed;
+		s0.ship = mode == Mode::Ship;
+		s0.ground = p->m_isOnGround;
+		s0.held = f->holding;
+
+		float reach = f->speed * (H / 60.f) + 90.f;
+		int slot = 0;
+		for (auto it = lowerIt(pos.x - 200.f); it != f->objs.end() && it->r.x0 <= pos.x + reach; ++it) {
+			if (it->r.x1 < pos.x - 60.f) continue;
+			Obj o = *it;
+			if (o.k == K_ORB || o.k == K_PAD || o.k == K_PORTAL) {
+				if (slot < 64) {
+					o.ix = slot++;
+					if (o.used) s0.mask |= 1ull << o.ix;
+				}
+			}
+			env.loc.push_back(o);
+		}
+
+		Plan pl = search(s0, env, H, W);
+		f->alive = pl.alive;
+		f->predY = pl.y1;
+		f->havePred = pl.alive > 0;
+
+		setHold(pl.hold);
+		updateHud(true, mode);
+		drawDebug(s0, env, pl);
 	}
 
-	// ---- Input helpers ----------------------------------------------------
+	// ---- Input -------------------------------------------------------------
 
 	void setHold(bool want) {
 		auto& f = m_fields;
 		if (want == f->holding) return;
 		f->holding = want;
-		if (want) ++f->clicks;
+		if (want) { ++f->clicks; f->pressedLast = true; }
 		this->handleButton(want, 1, true); // 1 = jump, last arg = player 1
 	}
 
@@ -245,42 +609,56 @@ class $modify(BotPlayLayer, PlayLayer) {
 		if (m_fields->holding) setHold(false);
 	}
 
-	// ---- HUD and debug overlay -------------------------------------------
+	// ---- HUD and debug overlay ---------------------------------------------
 
 	void updateHud(bool active, Mode mode) {
-		auto hud = m_fields->hud;
-		if (!hud) return;
+		auto& f = m_fields;
+		if (!f->hud) return;
 		std::string s = active ? "AutoBot ON" : "AutoBot OFF";
 		s += " | ";
 		s += modeName(mode);
 		if (active && !supported(mode)) s += " (unsupported)";
-		s += " | clicks " + std::to_string(m_fields->clicks);
-		hud->setString(s.c_str());
+		s += " | clicks " + std::to_string(f->clicks);
+		if (active && supported(mode)) {
+			s += " | plan " + std::to_string(f->alive) + "f";
+			s += " | err " + std::to_string(static_cast<int>(std::lround(f->err * 10.f)) / 10.f).substr(0, 5);
+			if (mode == Mode::Ship) {
+				s += " | aUp " + std::to_string(f->aUp).substr(0, 4);
+				s += " aDn " + std::to_string(f->aDown).substr(0, 4);
+			}
+		}
+		f->hud->setString(s.c_str());
 	}
 
-	void drawDebug() {
+	void drawDebug(Sim const& s0, Env const& env, Plan const& pl) {
 		auto d = m_fields->debug;
 		if (!d) return;
 		d->clear();
 		if (!Mod::get()->getSettingValue<bool>("debug-draw")) return;
 
-		float px = m_player1->getPositionX();
-		auto draw = [&](CCRect const& r, ccColor4F col) {
+		auto drawRect = [&](Rc const& r, ccColor4F col) {
 			CCPoint v[4] = {
-				{r.getMinX(), r.getMinY()}, {r.getMaxX(), r.getMinY()},
-				{r.getMaxX(), r.getMaxY()}, {r.getMinX(), r.getMaxY()}
+				{r.x0, r.y0}, {r.x1, r.y0}, {r.x1, r.y1}, {r.x0, r.y1}
 			};
 			d->drawPolygon(v, 4, {0, 0, 0, 0}, 1.f, col);
 		};
-		for (auto const& r : m_fields->hazards) {
-			if (r.getMaxX() < px) continue;
-			if (r.getMinX() > px + 600.f) break;
-			draw(r, {1.f, 0.2f, 0.2f, 1.f});
+		for (auto const& o : env.loc) {
+			if (o.r.x1 < s0.x) continue;
+			ccColor4F col = o.k == K_HAZARD ? ccColor4F{1.f, 0.2f, 0.2f, 1.f}
+			              : o.k == K_SOLID  ? ccColor4F{0.3f, 0.6f, 1.f, 0.8f}
+			              : o.k == K_PORTAL ? ccColor4F{0.8f, 0.4f, 1.f, 1.f}
+			                                : ccColor4F{1.f, 0.9f, 0.2f, 1.f};
+			drawRect(o.r, col);
 		}
-		for (auto const& o : m_fields->orbs) {
-			if (o.rect.getMaxX() < px) continue;
-			if (o.rect.getMinX() > px + 600.f) break;
-			draw(o.rect, {1.f, 0.9f, 0.2f, 1.f});
+
+		// Re-simulate the chosen plan and draw the path the bot expects to take.
+		Sim s = s0;
+		CCPoint prev = {s.x, s.y * s.sgn};
+		for (int i = 0; i < pl.alive; ++i) {
+			if (!stepFrame(s, ((pl.acts >> i) & 1ull) != 0, env)) break;
+			CCPoint cur = {s.x, s.y * s.sgn};
+			d->drawSegment(prev, cur, 1.2f, {0.2f, 1.f, 0.4f, 1.f});
+			prev = cur;
 		}
 	}
 };
