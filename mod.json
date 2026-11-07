@@ -6,9 +6,9 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"id": "nickysigmadiddy.autobot",
-	"name": "nickysigmadiddy",
-	"version": "v0.1.0",
+	"id": "yourname.autobot",
+	"name": "AutoBot",
+	"version": "v0.2.0",
 	"developer": "yourname",
 	"description": "Autonomous bot: reads hazards and plays by gamemode.",
 	"settings": {
@@ -33,6 +33,12 @@
 		"debug-draw": {
 			"type": "bool",
 			"name": "Draw debug overlay",
+			"default": true
+		},
+		"use-orbs": {
+			"type": "bool",
+			"name": "Click orbs",
+			"description": "Click orbs when the player touches them.",
 			"default": true
 		}
 	}
