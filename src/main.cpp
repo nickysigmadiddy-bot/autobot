@@ -39,10 +39,8 @@ class $modify(BotPlayLayer, PlayLayer) {
 		auto& hz = m_fields->hazards;
 		hz.clear();
 
-		if (m_objects) {
-			CCObject* o;
-			CCARRAY_FOREACH(m_objects, o) {
-				auto obj = static_cast<GameObject*>(o);
+				if (m_objects) {
+			for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
 				if (obj->m_objectType == GameObjectType::Hazard) {
 					// Use the real hitbox, not the sprite bounds.
 					hz.push_back(obj->getObjectRect());
