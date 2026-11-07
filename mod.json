@@ -8,9 +8,9 @@
 	},
 	"id": "yourname.autobot",
 	"name": "AutoBot",
-	"version": "v0.2.0",
+	"version": "v0.3.0",
 	"developer": "yourname",
-	"description": "Autonomous bot: reads hazards and plays by gamemode.",
+	"description": "Lookahead bot: simulates cube/robot/ship physics and picks safe clicks.",
 	"settings": {
 		"enabled": {
 			"type": "bool",
@@ -22,23 +22,40 @@
 			"name": "Only run in practice mode",
 			"default": true
 		},
-		"lead-time": {
+		"horizon": {
+			"type": "int",
+			"name": "Lookahead (frames at 60 fps)",
+			"description": "How far ahead the planner simulates. 50 is about 0.8 s.",
+			"default": 50,
+			"min": 20,
+			"max": 62
+		},
+		"beam-width": {
+			"type": "int",
+			"name": "Planner width",
+			"description": "Paths kept per frame. Higher is smarter but uses more CPU.",
+			"default": 80,
+			"min": 16,
+			"max": 300
+		},
+		"hazard-margin": {
 			"type": "float",
-			"name": "Cube jump lead time (s)",
-			"description": "How long before a hazard the bot clicks. Tune this.",
-			"default": 0.11,
-			"min": 0.02,
-			"max": 0.4
+			"name": "Hazard safety margin (units)",
+			"description": "Spikes are treated as this much bigger. Raise it if the bot clips spikes.",
+			"default": 2.0,
+			"min": 0.0,
+			"max": 8.0
 		},
 		"debug-draw": {
 			"type": "bool",
 			"name": "Draw debug overlay",
+			"description": "Red = hazards, blue = blocks, yellow = orbs/pads, green line = the path the bot plans.",
 			"default": true
 		},
 		"use-orbs": {
 			"type": "bool",
 			"name": "Click orbs",
-			"description": "Click orbs when the player touches them.",
+			"description": "Let the planner click orbs when the player touches them.",
 			"default": true
 		}
 	}
