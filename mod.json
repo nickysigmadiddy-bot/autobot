@@ -1,0 +1,39 @@
+{
+	"geode": "4.0.0",
+	"gd": {
+		"win": "2.2081",
+		"android": "2.2081",
+		"mac": "2.2081",
+		"ios": "2.2081"
+	},
+	"id": "nickysigmadiddy.autobot",
+	"name": "nickysigmadiddy",
+	"version": "v0.1.0",
+	"developer": "yourname",
+	"description": "Autonomous bot: reads hazards and plays by gamemode.",
+	"settings": {
+		"enabled": {
+			"type": "bool",
+			"name": "Enable bot",
+			"default": true
+		},
+		"practice-only": {
+			"type": "bool",
+			"name": "Only run in practice mode",
+			"default": true
+		},
+		"lead-time": {
+			"type": "float",
+			"name": "Cube jump lead time (s)",
+			"description": "How long before a hazard the bot clicks. Tune this.",
+			"default": 0.11,
+			"min": 0.02,
+			"max": 0.4
+		},
+		"debug-draw": {
+			"type": "bool",
+			"name": "Draw debug overlay",
+			"default": true
+		}
+	}
+}
