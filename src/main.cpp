@@ -13,10 +13,10 @@
 using namespace geode::prelude;
 
 // ===========================================================================
-// AutoBot v0.6.1 - cube only, step-aligned, exact search, committed plans.
-// v0.6.1: fixed-rate planning (max 240 steps/s) independent of render FPS,
-// sub-step skipping at very high FPS, pruned search, allocation-free dead
-// table, reused planner environment, throttled HUD/overlay/settings.
+// AutoBot v0.6.2 - cube only, step-aligned, exact search, committed plans.
+// v0.6.2: planning wall / horizon only safe once landed, decision-level
+// learning (bans), real-death-only counting, start spike filtered, death
+// forensics, perf profiler, smooth 60 Hz path overlay.
 // ===========================================================================
 
 constexpr float BASE_SPEED = 311.58f;
@@ -24,7 +24,13 @@ constexpr double SEARCH_MS_FULL = 2.0;
 constexpr double SEARCH_MS_DEADEND = 1.0;
 constexpr float DIV_TOL = 0.8f;
 constexpr int DIV_COOLDOWN = 24;
-constexpr float MIN_PLAN_H = 0.25f;   // 240 steps per second at most
+constexpr float MIN_PLAN_H = 0.25f;     // 240 steps per second at most
+constexpr float WALL_SLACK = 90.f;      // units past an unsupported object we keep simulating while airborne
+constexpr int SETTLE_STEPS = 60;        // extra steps allowed past the horizon to land
+constexpr float BAN_TOL_X = 0.6f;
+constexpr float BAN_TOL_Y = 0.6f;
+constexpr size_t MAX_BANS = 96;
+constexpr int DEC_RING = 1024;
 namespace phys {
 	constexpr float HALF = 15.f;
 	constexpr float GRAVITY = 0.864f;
@@ -86,6 +92,9 @@ static inline bool hit(Rc const& a, Rc const& b) {
 	return a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
 }
 
+// A learned "never do this here" rule: at world position (x, y) do not take action act (0 wait, 1 click).
+struct Ban { float x, y; uint8_t act; };
+
 enum Kind : uint8_t { K_SOLID, K_HAZARD, K_ORB, K_PAD, K_PORTAL };
 
 struct Obj {
@@ -142,8 +151,6 @@ struct Sim {
 	uint64_t mask = 0;
 };
 
-struct Band { float x, y; };
-
 struct Env {
 	std::vector<Obj> loc;
 	float maxW = 30.f;
@@ -153,7 +160,7 @@ struct Env {
 	float h = 0.25f;
 	float limitX = 1e9f;
 	bool useOrbs = true;
-	std::vector<Band> const* forbid = nullptr;
+	std::vector<Ban> const* forbid = nullptr;   // sorted by x
 };
 
 static inline Rc box(Sim const& s, float h) {
@@ -264,11 +271,16 @@ static bool touchingOrb(Sim const& s, Env const& e) {
 	return false;
 }
 
-static bool canPress(Sim const& s, Env const& e) {
-	if (!e.forbid) return true;
+// False if a learned ban forbids this action in this exact state.
+static bool canAct(Sim const& s, Env const& e, bool press) {
+	if (!e.forbid || e.forbid->empty()) return true;
 	float wy = s.y * s.sgn;
-	for (auto const& b : *e.forbid) {
-		if (std::abs(s.x - b.x) < 3.5f && std::abs(wy - b.y) < 3.f) return false;
+	uint8_t a = press ? 1 : 0;
+	auto const& v = *e.forbid;
+	auto it = std::lower_bound(v.begin(), v.end(), s.x - BAN_TOL_X,
+		[](Ban const& b, float x) { return b.x < x; });
+	for (; it != v.end() && it->x < s.x + BAN_TOL_X; ++it) {
+		if (it->act == a && std::abs(wy - it->y) < BAN_TOL_Y) return false;
 	}
 	return true;
 }
@@ -360,7 +372,10 @@ struct Searcher {
 	bool dfs(Sim s, int t) {
 		size_t base = path.size();
 		for (;;) {
-			if (t >= H || s.x >= e->limitX) return true;
+			// A plan only counts as safe once the cube has landed (or after a generous settle window),
+			// so we never "succeed" while falling toward a spike just past the end.
+			if (t >= H && (s.ground || t >= H + SETTLE_STEPS)) return true;
+			if (s.x >= e->limitX && (s.ground || s.x >= e->limitX + WALL_SLACK)) return true;
 			if (t > bestT) { bestT = t; bestPath = path; }
 			if (stop()) { path.resize(base); return false; }
 
@@ -377,12 +392,12 @@ struct Searcher {
 			if (dead.has(k)) { path.resize(base); return false; }
 
 			Sim w = s;
-			if (stepFrame(w, false, *e)) {
+			if (canAct(s, *e, false) && stepFrame(w, false, *e)) {
 				path.push_back(0);
 				if (dfs(w, t + 1)) return true;
 				path.pop_back();
 			}
-			if (!timeUp && canPress(s, *e) && (orb || pressRelevant(s, *e))) {
+			if (!timeUp && canAct(s, *e, true) && (orb || pressRelevant(s, *e))) {
 				Sim p = s;
 				if (stepFrame(p, true, *e)) {
 					path.push_back(1);
@@ -404,6 +419,8 @@ struct Plan {
 	bool valid = false;
 	bool full = false;
 	bool clipped = false;
+	bool timedOut = false;
+	long nodes = 0;
 };
 
 static void makePlan(Sim const& s0, Env const& e, int H, long budget, double msLimit, Plan& out) {
@@ -428,7 +445,7 @@ static void makePlan(Sim const& s0, Env const& e, int H, long budget, double msL
 			int cmin = p0;
 			for (int c = p0 - 1; c >= 0 && c >= p0 - back; --c) {
 				Sim const& st = pre[c];
-				if (!(st.ground || touchingOrb(st, e)) || !canPress(st, e)) break;
+				if (!(st.ground || touchingOrb(st, e)) || !canAct(st, e, true)) break;
 				Sim q = st;
 				if (!stepFrame(q, true, e)) break;
 				S.path.assign(c, 0);
@@ -439,7 +456,7 @@ static void makePlan(Sim const& s0, Env const& e, int H, long budget, double msL
 			int c = (cmin + p0) / 2;
 			if (cmin < p0 && c != p0 && !S.timeUp) {
 				Sim q = pre[c];
-				if (stepFrame(q, true, e)) {
+				if (canAct(q, e, true) && stepFrame(q, true, e)) {
 					S.path.assign(c, 0);
 					S.path.push_back(1);
 					if (S.dfs(q, c + 1)) acts = S.path;
@@ -462,12 +479,26 @@ static void makePlan(Sim const& s0, Env const& e, int H, long budget, double msL
 	out.valid = true;
 	out.full = ok;
 	out.clipped = ok && (int)acts.size() < H;
+	out.timedOut = S.timeUp;
+	out.nodes = S.nodes;
 }
 
 // ===========================================================================
 // Bot state
 // ===========================================================================
 struct Rec { float x, y, vN, predY, err; bool gr, act; };
+struct Dec { float x, y; uint8_t act; };
+
+struct Perf {
+	double stepUsSum = 0.0, stepUsMax = 0.0;      // our bot code per physics step
+	double gameUsSum = 0.0, gameUsMax = 0.0;      // the game's own processCommands (all mods)
+	long steps = 0;
+	double planMsSum = 0.0, planMsMax = 0.0;
+	long plans = 0;
+	double uiUsSum = 0.0, uiUsMax = 0.0;          // HUD + overlay + perf per render frame
+	long frames = 0;
+	Clock::time_point winStart{};
+};
 
 struct Bot {
 	std::vector<Obj> objs;
@@ -479,7 +510,7 @@ struct Bot {
 	int clicks = 0, deaths = 0, phantom = 0, replans = 0;
 
 	float prevX = -1.f, prevY = 0.f;
-	float sinceTick = 0.f;   // real frames (1/60 s) elapsed since the last bot tick
+	float sinceTick = 0.f;
 	float planH = 0.25f;
 	float speed = BASE_SPEED;
 
@@ -487,6 +518,8 @@ struct Bot {
 	float predX = 0.f, predY = 0.f;
 	float err = 0.f, maxErr = 0.f;
 	bool diverged = false;
+	int divLogged = 0;
+	int sinceDiv = 1000000;
 	bool forceReplan = false;
 	int cool = 0;
 
@@ -495,24 +528,40 @@ struct Bot {
 
 	Rec ring[48];
 	int ringN = 0;
+	Dec decs[DEC_RING];
+	int decN = 0;
 	int sincePress = 1000000;
 	float pressX = 0.f, pressY = 0.f;
-	std::vector<Band> forbid;
+	std::vector<Ban> bans;
 
 	double lastMs = 0.0, maxMs = 0.0;
 	int aheadId = -1, aheadDist = 0;
 
-	CCDrawNode* debug = nullptr;
+	CCDrawNode* debug = nullptr;      // static objects (rebuilt after a new plan)
+	CCDrawNode* pathNode = nullptr;   // remaining planned path (rebuilt up to 60x/s)
 	CCLabelBMFont* hud = nullptr;
 	bool active = false;
 	char const* modeStr = "cube";
 
-	unsigned frameCtr = 0;
-	int drawVer = 0, drawnVer = -1;
-	Clock::time_point lastHudT{}, lastDrawT{}, lastDeathLogT{};
+	int drawVer = 0, drawnVer = -1, pathVer = -1, lastPathIdx = -1;
+	Clock::time_point lastHudT{}, lastDrawT{}, lastPathT{}, lastDeathLogT{}, lastDeadLogT{};
 	std::string lastHud;
+	Perf perf;
+	double stepAvgUs = 0.0;
 };
 static Bot G;
+
+static bool banExists(float x, float y, uint8_t act) {
+	for (auto const& b : G.bans) {
+		if (b.act == act && std::abs(b.x - x) < 0.05f && std::abs(b.y - y) < 0.05f) return true;
+	}
+	return false;
+}
+static void addBan(float x, float y, uint8_t act) {
+	if (G.bans.size() >= MAX_BANS) G.bans.erase(G.bans.begin());
+	G.bans.push_back({x, y, act});
+	std::sort(G.bans.begin(), G.bans.end(), [](Ban const& a, Ban const& b) { return a.x < b.x; });
+}
 
 static void releaseBtn(GJBaseGameLayer* gl) {
 	if (!G.holding) return;
@@ -534,6 +583,25 @@ static void setHold(GJBaseGameLayer* gl, bool want, PlayerObject* p) {
 
 static void resetTracking() {
 	G.prevX = -1.f; G.havePred = false; G.plan.valid = false; G.sinceTick = 0.f;
+}
+
+// Logs one line every 5 s so we can see where frame time really goes.
+static void perfTick(Clock::time_point now) {
+	auto& P = G.perf;
+	if (P.winStart.time_since_epoch().count() == 0) { P.winStart = now; return; }
+	double el = std::chrono::duration<double>(now - P.winStart).count();
+	if (el < 5.0) return;
+	if (G.active && P.steps > 0 && P.frames > 0) {
+		G.stepAvgUs = P.stepUsSum / (double)P.steps;
+		log::info("[AutoBot] perf: {:.0f} render fps | {:.0f} steps/s | bot {:.1f}us avg {:.0f}us max | game step {:.1f}us avg {:.0f}us max | {} plans {:.2f}ms avg {:.2f}ms max | hud+overlay {:.1f}us avg {:.0f}us max",
+			(double)P.frames / el, (double)P.steps / el,
+			G.stepAvgUs, P.stepUsMax,
+			P.gameUsSum / (double)P.steps, P.gameUsMax,
+			P.plans, P.plans ? P.planMsSum / (double)P.plans : 0.0, P.planMsMax,
+			P.uiUsSum / (double)P.frames, P.uiUsMax);
+	}
+	P = Perf();
+	P.winStart = now;
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +633,7 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 	G.sinceTick += hRaw;
 	bool fresh = G.prevX < 0.f;
 	float h = std::max(MIN_PLAN_H, std::round(hRaw * 4.f) / 4.f);
-	if (!fresh && G.sinceTick < h - 0.02f) return;   // sub-step: keep current input
+	if (!fresh && G.sinceTick < h - 0.02f) return;
 	float elapsed = fresh ? h : G.sinceTick;
 	G.sinceTick = 0.f;
 
@@ -597,6 +665,7 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 	}
 
 	// ---- prediction audit ---------------------------------------------------
+	if (G.sinceDiv < 1000000) ++G.sinceDiv;
 	float stepErr = 0.f;
 	if (G.havePred && !fresh) {
 		float ex = pos.x - G.predX, ey = pos.y - G.predY;
@@ -604,16 +673,18 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 		G.err = ey;
 		G.maxErr = std::max(G.maxErr, std::abs(ey));
 		if (stepErr > DIV_TOL) {
+			G.sinceDiv = 0;
+			G.diverged = true;
 			if (G.cool == 0) { G.forceReplan = true; G.cool = DIV_COOLDOWN; }
-			if (!G.diverged) {
-				G.diverged = true;
+			if (G.divLogged < 5) {
+				++G.divLogged;
 				int nearId = -1;
 				for (auto it = lowerBoundX(G.objs, pos.x - 100.f); it != G.objs.end() && it->r.x0 < pos.x + 60.f; ++it) {
 					Rc pr{pos.x - 25.f, pos.y - 25.f, pos.x + 25.f, pos.y + 25.f};
 					if (hit(pr, it->r)) { nearId = it->id; break; }
 				}
-				log::info("[AutoBot] FIRST DIVERGENCE x={} y={} dx={} dy={} vRaw={} vN={} gnd={} sgn={} speed={} h={} nearObj={}",
-					(double)pos.x, (double)pos.y, (double)ex, (double)ey, (double)p->m_yVelocity,
+				log::info("[AutoBot] DIVERGENCE #{} x={} y={} dx={} dy={} vRaw={} vN={} gnd={} sgn={} speed={} h={} nearObj={}",
+					G.divLogged, (double)pos.x, (double)pos.y, (double)ex, (double)ey, (double)p->m_yVelocity,
 					(double)vN, p->m_isOnGround, (double)sgn, (double)G.speed, (double)h, nearId);
 			}
 		}
@@ -685,13 +756,13 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 		env.useOrbs = C.useOrbs;
 		env.h = h;
 		env.limitX = limitX;
-		env.forbid = &G.forbid;
+		env.forbid = &G.bans;
 
 		Sim s0;
 		s0.x = pos.x; s0.sgn = sgn; s0.y = pos.y * sgn; s0.vy = vN;
 		s0.speed = G.speed; s0.ground = p->m_isOnGround; s0.held = G.holding;
 
-		float reachX = G.speed * (H / 60.f) + 90.f;
+		float reachX = G.speed * (H / 60.f) + 90.f + (SETTLE_STEPS * h / 60.f) * G.speed;
 		int slot = 0;
 		for (auto it = lowerBoundX(G.objs, pos.x - 200.f); it != G.objs.end() && it->r.x0 <= pos.x + reachX; ++it) {
 			if (it->r.x1 < pos.x - 60.f) continue;
@@ -711,10 +782,24 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 		makePlan(s0, env, Hs, C.budget, lim, G.plan);
 		G.lastMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 		G.maxMs = std::max(G.maxMs, G.lastMs);
+		G.perf.planMsSum += G.lastMs;
+		G.perf.planMsMax = std::max(G.perf.planMsMax, G.lastMs);
+		++G.perf.plans;
 		G.forceReplan = false;
 		G.planH = h;
 		++G.replans;
 		++G.drawVer;
+
+		if (!G.plan.full) {
+			auto now = Clock::now();
+			if (std::chrono::duration<double>(now - G.lastDeadLogT).count() > 1.0) {
+				G.lastDeadLogT = now;
+				log::info("[AutoBot] dead-end plan at x={} y={} vN={} gnd={} | sim survives {} steps, dies near x={} | timedOut={} nodes={} wallId={} wallDist={}",
+					(double)pos.x, (double)pos.y, (double)vN, p->m_isOnGround, G.plan.acts.size(),
+					(double)(G.plan.px.empty() ? pos.x : G.plan.px.back()),
+					G.plan.timedOut, G.plan.nodes, G.aheadId, G.aheadDist);
+			}
+		}
 	}
 
 	// ---- execute the committed plan --------------------------------------------
@@ -730,6 +815,12 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 	}
 	setHold(gl, act, p);
 
+	// Remember every decision made while standing on something (the only time there is a real choice).
+	if (p->m_isOnGround) {
+		G.decs[G.decN % DEC_RING] = {pos.x, pos.y, (uint8_t)(act ? 1 : 0)};
+		++G.decN;
+	}
+
 	Rec& r = G.ring[G.ringN % 48];
 	r = {pos.x, pos.y, vN, predNY, stepErr, p->m_isOnGround, act};
 	++G.ringN;
@@ -742,7 +833,19 @@ class $modify(BotGame, GJBaseGameLayer) {
 	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
 		auto pl = PlayLayer::get();
 		if (pl && static_cast<GJBaseGameLayer*>(pl) == this) {
+			auto t0 = Clock::now();
 			botStep(this, pl, dt);
+			auto t1 = Clock::now();
+			GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+			auto t2 = Clock::now();
+			double botUs = std::chrono::duration<double, std::micro>(t1 - t0).count();
+			double gameUs = std::chrono::duration<double, std::micro>(t2 - t1).count();
+			G.perf.stepUsSum += botUs;
+			G.perf.stepUsMax = std::max(G.perf.stepUsMax, botUs);
+			G.perf.gameUsSum += gameUs;
+			G.perf.gameUsMax = std::max(G.perf.gameUsMax, gameUs);
+			++G.perf.steps;
+			return;
 		}
 		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 	}
@@ -769,12 +872,15 @@ class $modify(BotPlay, PlayLayer) {
 
 		G.objs.clear();
 		G.unsup.clear();
-		G.forbid.clear();
+		G.bans.clear();
 		G.plan = Plan();
 		G.floorY = 90.f; G.ceilY = 390.f; G.ceilLearned = false;
 		G.sinceTick = 0.f;
+		G.decN = 0; G.sinceDiv = 1000000; G.divLogged = 0;
+		G.perf = Perf();
 		G.dbgEnv.loc.reserve(512);
 
+		int skippedStart = 0;
 		if (m_objects) {
 			for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
 				int id = obj->m_objectID;
@@ -788,7 +894,11 @@ class $modify(BotPlay, PlayLayer) {
 					G.unsup.push_back({o.r.x0, id});
 					continue;
 				}
-				else if (obj->m_objectType == GameObjectType::Hazard) o.k = K_HAZARD;
+				else if (obj->m_objectType == GameObjectType::Hazard) {
+					// A hazard overlapping the spawn point is GD's own start/anti-cheat spike, not level geometry.
+					if (o.r.x0 < 30.f) { ++skippedStart; continue; }
+					o.k = K_HAZARD;
+				}
 				else if (obj->m_objectType == GameObjectType::Solid)  o.k = K_SOLID;
 				else continue;
 				G.objs.push_back(o);
@@ -799,7 +909,9 @@ class $modify(BotPlay, PlayLayer) {
 
 		G.debug = CCDrawNode::create();
 		m_objectLayer->addChild(G.debug, 1000);
-		G.drawVer = 0; G.drawnVer = -1;
+		G.pathNode = CCDrawNode::create();
+		m_objectLayer->addChild(G.pathNode, 1001);
+		G.drawVer = 0; G.drawnVer = -1; G.pathVer = -1; G.lastPathIdx = -1;
 
 		G.hud = CCLabelBMFont::create("AutoBot", "bigFont.fnt");
 		G.hud->setScale(0.35f);
@@ -810,12 +922,13 @@ class $modify(BotPlay, PlayLayer) {
 		this->addChild(G.hud, 1000);
 		G.lastHud.clear();
 
-		log::info("[AutoBot] v0.6.1 ready: {} objects, {} unsupported. Planning at <=240 steps/s.",
-			G.objs.size(), G.unsup.size());
+		log::info("[AutoBot] v0.6.2 ready: {} objects, {} unsupported, {} start hazards ignored. Planning at <=240 steps/s.",
+			G.objs.size(), G.unsup.size(), skippedStart);
 	}
 
 	void onQuit() {
 		G.debug = nullptr;
+		G.pathNode = nullptr;
 		G.hud = nullptr;
 		G.plan = Plan();
 		G.prevX = -1.f;
@@ -831,18 +944,23 @@ class $modify(BotPlay, PlayLayer) {
 		G.havePred = false;
 		G.plan.valid = false;
 		G.diverged = false;
+		G.divLogged = 0;
+		G.sinceDiv = 1000000;
 		G.err = 0.f;
 		G.cool = 0;
 		G.sinceTick = 0.f;
 		G.sincePress = 1000000;
+		G.decN = 0;
 		++G.drawVer;
 	}
 
 	void destroyPlayer(PlayerObject* player, GameObject* object) {
-		if (player == m_player1 && !m_player1->m_isDead && G.active && C.enabled) {
+		bool wasDead = m_player1 ? m_player1->m_isDead : true;
+		PlayLayer::destroyPlayer(player, object);
+		// Only count it if the player really died (GD calls this for harmless start-spike touches too).
+		if (player == m_player1 && !wasDead && m_player1->m_isDead && G.active && C.enabled) {
 			onDeath(object);
 		}
-		PlayLayer::destroyPlayer(player, object);
 	}
 
 	void onDeath(GameObject* killer) {
@@ -859,16 +977,31 @@ class $modify(BotPlay, PlayLayer) {
 
 		++G.deaths;
 		char const* cls;
-		bool addBand = false;
-		if (G.diverged)                           { cls = "MODEL ERROR (sim diverged before death)"; addBand = true; }
-		else if (G.plan.valid && !G.plan.full)    { cls = "PLANNER DEAD END (no survivable path found)"; }
-		else                                      { cls = "UNSEEN (plan was clean: unmodelled object/hitbox)"; addBand = true; }
+		if (G.plan.valid && !G.plan.full)  cls = "PLANNER DEAD END (sim saw no survivable path)";
+		else if (G.sinceDiv < 120)         cls = "MODEL ERROR (sim diverged shortly before death)";
+		else                               cls = "UNSEEN (plan was clean: unmodelled object/hitbox)";
+
+		int kid = killer ? killer->m_objectID : -1;
+		Rc kr{0.f, 0.f, 0.f, 0.f};
+		int knownKind = -1;   // -1 = the sim does not know this object at all; 0 solid, 1 hazard, 2 orb, 3 pad, 4 portal
+		if (killer) {
+			kr = toRc(killer->getObjectRect());
+			for (auto it = lowerBoundX(G.objs, kr.x0 - 40.f); it != G.objs.end() && it->r.x0 < kr.x1 + 40.f; ++it) {
+				if (it->id == kid && std::abs(it->r.x0 - kr.x0) < 1.f && std::abs(it->r.y0 - kr.y0) < 1.f) {
+					knownKind = (int)it->k;
+					break;
+				}
+			}
+		}
 
 		auto now = Clock::now();
 		bool dump = std::chrono::duration<double>(now - G.lastDeathLogT).count() > 3.0;
 		log::info("[AutoBot] death #{} x={} y={} killerId={} speed={} class={} replans={} maxErr={} lastSearch={}ms",
-			G.deaths, (double)pos.x, (double)pos.y, killer ? killer->m_objectID : -1,
+			G.deaths, (double)pos.x, (double)pos.y, kid,
 			(double)G.speed, cls, G.replans, (double)G.maxErr, G.lastMs);
+		log::info("[AutoBot]   killer rect=[{}, {}, {}, {}] simKnowsIt={} wallId={} wallDist={} planSteps={} planFull={} timedOut={}",
+			(double)kr.x0, (double)kr.y0, (double)kr.x1, (double)kr.y1, knownKind,
+			G.aheadId, G.aheadDist, G.plan.acts.size(), G.plan.full, G.plan.timedOut);
 
 		if (dump) {
 			G.lastDeathLogT = now;
@@ -881,35 +1014,44 @@ class $modify(BotPlay, PlayLayer) {
 		}
 
 		if (!C.learn) return;
-		if (addBand && G.sincePress < 160) {
-			if (G.forbid.size() >= 64) G.forbid.erase(G.forbid.begin());
-			G.forbid.push_back({G.pressX, G.pressY});
-			log::info("[AutoBot] forbidden click band at x={} y={} ({} total)",
-				(double)G.pressX, (double)G.pressY, G.forbid.size());
+		// Learning: blame the most recent ground decision that is not already banned and forbid
+		// that exact choice at that exact spot. The planner then has to find something else, and
+		// because it looks ahead, repeated bans push the fix back to the true cause.
+		int n = std::min(G.decN, DEC_RING);
+		for (int i = 1; i <= n; ++i) {
+			Dec const& d = G.decs[(G.decN - i) % DEC_RING];
+			if (banExists(d.x, d.y, d.act)) continue;
+			addBan(d.x, d.y, d.act);
+			log::info("[AutoBot] learned: never {} at x={} y={} (decision {} ground-ticks before death, {} bans total)",
+				d.act ? "click" : "wait", (double)d.x, (double)d.y, i, G.bans.size());
+			break;
 		}
 	}
 
 	void postUpdate(float dt) {
 		PlayLayer::postUpdate(dt);
-		// Render FPS can be thousands; only do UI work on every 8th frame.
-		if ((++G.frameCtr & 7u) != 0u) return;
-		updateHud();
-		drawDebug();
+		auto t0 = Clock::now();
+		++G.perf.frames;
+		updateHud(t0);
+		drawDebug(t0);
+		perfTick(t0);
+		double us = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+		G.perf.uiUsSum += us;
+		G.perf.uiUsMax = std::max(G.perf.uiUsMax, us);
 	}
 
-	void updateHud() {
+	void updateHud(Clock::time_point now) {
 		if (!G.hud) return;
-		auto now = Clock::now();
-		if (std::chrono::duration<double>(now - G.lastHudT).count() < 0.25) return;
+		if (std::chrono::duration<double>(now - G.lastHudT).count() < 0.1) return;
 		G.lastHudT = now;
 
-		char buf[200];
-		std::snprintf(buf, sizeof(buf), "AutoBot %s | %s%s | clk %d dth %d | plan %d%s | err %.2f/%.2f | %.1fms",
+		char buf[256];
+		std::snprintf(buf, sizeof(buf), "AutoBot %s | %s%s | clk %d dth %d | plan %d%s | err %.2f/%.2f | %.1fms | bans %d | %.0fus/step",
 			G.active ? "ON" : "OFF", G.modeStr, (G.active && !isCube(m_player1)) ? " (cube only)" : "",
 			G.clicks, G.deaths,
 			(int)(G.plan.valid ? G.plan.acts.size() - std::min(G.plan.idx, G.plan.acts.size()) : 0),
 			(G.plan.valid && !G.plan.full) ? " DEADEND" : "",
-			(double)G.err, (double)G.maxErr, G.lastMs);
+			(double)G.err, (double)G.maxErr, G.lastMs, (int)G.bans.size(), G.stepAvgUs);
 		std::string s = buf;
 		if (G.aheadId >= 0 && G.aheadDist < 600) {
 			char b2[64];
@@ -921,47 +1063,63 @@ class $modify(BotPlay, PlayLayer) {
 		G.hud->setString(s.c_str());
 	}
 
-	void drawDebug() {
+	void drawDebug(Clock::time_point now) {
 		auto d = G.debug;
-		if (!d) return;
+		auto pn = G.pathNode;
+		if (!d || !pn) return;
 		if (!G.active || !C.debugDraw) {
-			if (G.drawnVer != -2) { d->clear(); G.drawnVer = -2; }
+			if (G.drawnVer != -2) { d->clear(); pn->clear(); G.drawnVer = -2; G.lastPathIdx = -1; G.pathVer = -1; }
 			return;
 		}
-		if (G.drawnVer == G.drawVer) return;
-		auto now = Clock::now();
-		if (std::chrono::duration<double>(now - G.lastDrawT).count() < 0.15) return;
-		G.lastDrawT = now;
-		G.drawnVer = G.drawVer;
-		d->clear();
 
-		auto drawRect = [&](Rc const& r, ccColor4F col) {
-			CCPoint v[4] = {{r.x0, r.y0}, {r.x1, r.y0}, {r.x1, r.y1}, {r.x0, r.y1}};
-			d->drawPolygon(v, 4, {0, 0, 0, 0}, 1.f, col);
-		};
 		float px = m_player1->getPositionX();
-		int drawn = 0;
-		for (auto const& o : G.dbgEnv.loc) {
-			if (o.r.x1 < px - 20.f || o.r.x0 > px + 500.f) continue;
-			if (++drawn > 120) break;
-			ccColor4F col = o.k == K_HAZARD ? ccColor4F{1.f, 0.2f, 0.2f, 1.f}
-			              : o.k == K_SOLID  ? ccColor4F{0.3f, 0.6f, 1.f, 0.8f}
-			              : o.k == K_PORTAL ? ccColor4F{0.8f, 0.4f, 1.f, 1.f}
-			                                : ccColor4F{1.f, 0.9f, 0.2f, 1.f};
-			drawRect(o.r, col);
+
+		// Static objects: rebuilt only after a new plan, at most ~7x per second, nearby only.
+		if (G.drawnVer != G.drawVer &&
+		    std::chrono::duration<double>(now - G.lastDrawT).count() >= 0.15) {
+			G.lastDrawT = now;
+			G.drawnVer = G.drawVer;
+			d->clear();
+
+			auto drawRect = [&](Rc const& r, ccColor4F col) {
+				CCPoint v[4] = {{r.x0, r.y0}, {r.x1, r.y0}, {r.x1, r.y1}, {r.x0, r.y1}};
+				d->drawPolygon(v, 4, {0, 0, 0, 0}, 1.f, col);
+			};
+			int drawn = 0;
+			for (auto const& o : G.dbgEnv.loc) {
+				if (o.r.x1 < px - 20.f || o.r.x0 > px + 360.f) continue;
+				if (++drawn > 80) break;
+				ccColor4F col = o.k == K_HAZARD ? ccColor4F{1.f, 0.2f, 0.2f, 1.f}
+				              : o.k == K_SOLID  ? ccColor4F{0.3f, 0.6f, 1.f, 0.8f}
+				              : o.k == K_PORTAL ? ccColor4F{0.8f, 0.4f, 1.f, 1.f}
+				                                : ccColor4F{1.f, 0.9f, 0.2f, 1.f};
+				drawRect(o.r, col);
+			}
+			for (auto const& u : G.unsup) {
+				if (u.first < px || u.first > px + 600.f) continue;
+				drawRect({u.first, 0.f, u.first + 30.f, 900.f}, {1.f, 0.5f, 0.f, 0.35f});
+			}
 		}
-		for (auto const& u : G.unsup) {
-			if (u.first < px || u.first > px + 600.f) continue;
-			drawRect({u.first, 0.f, u.first + 30.f, 900.f}, {1.f, 0.5f, 0.f, 0.35f});
-		}
-		if (G.plan.valid && !G.plan.px.empty()) {
-			CCPoint prev = {G.plan.px[0], G.plan.py[0]};
-			for (size_t i = 1; i < G.plan.px.size(); ++i) {
-				bool click = G.plan.acts[i] != 0;
-				if (!click && (i % 12) != 0 && i + 1 != G.plan.px.size()) continue;
-				CCPoint cur = {G.plan.px[i], G.plan.py[i]};
-				d->drawSegment(prev, cur, 1.2f, click ? ccColor4F{1.f, 1.f, 1.f, 1.f} : ccColor4F{0.2f, 1.f, 0.4f, 1.f});
-				prev = cur;
+
+		// Remaining planned path, starting at the player: refreshed up to 60x per second.
+		int idx = (int)G.plan.idx;
+		if ((idx != G.lastPathIdx || G.pathVer != G.drawVer) &&
+		    std::chrono::duration<double>(now - G.lastPathT).count() >= (1.0 / 60.0)) {
+			G.lastPathT = now;
+			G.lastPathIdx = idx;
+			G.pathVer = G.drawVer;
+			pn->clear();
+			if (G.plan.valid && G.plan.idx < G.plan.px.size()) {
+				size_t i0 = G.plan.idx;
+				size_t n = G.plan.px.size();
+				CCPoint prev = {px, m_player1->getPositionY()};
+				for (size_t i = i0; i < n; ++i) {
+					bool click = G.plan.acts[i] != 0;
+					if (!click && ((i - i0) % 12) != 11 && i + 1 != n) continue;
+					CCPoint cur = {G.plan.px[i], G.plan.py[i]};
+					pn->drawSegment(prev, cur, 1.2f, click ? ccColor4F{1.f, 1.f, 1.f, 1.f} : ccColor4F{0.2f, 1.f, 0.4f, 1.f});
+					prev = cur;
+				}
 			}
 		}
 	}
