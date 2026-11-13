@@ -541,14 +541,14 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 			G.forceReplan = true;
 			if (!G.diverged) {
 				G.diverged = true;
-				int near = -1;
+				int nearId = -1;
 				for (auto it = lowerBoundX(G.objs, pos.x - 100.f); it != G.objs.end() && it->r.x0 < pos.x + 60.f; ++it) {
 					Rc pr{pos.x - 25.f, pos.y - 25.f, pos.x + 25.f, pos.y + 25.f};
-					if (hit(pr, it->r)) { near = it->id; break; }
+					if (hit(pr, it->r)) { nearId = it->id; break; }
 				}
 				log::info("[AutoBot] FIRST DIVERGENCE x={} y={} dx={} dy={} vRaw={} vN={} gnd(real/pred)={}/{} sgn={} speed={} h={} nearObj={}",
 					(double)pos.x, (double)pos.y, (double)ex, (double)ey, (double)p->m_yVelocity,
-					(double)vN, p->m_isOnGround, G.predGround, (double)sgn, (double)G.speed, (double)h, near);
+					(double)vN, p->m_isOnGround, G.predGround, (double)sgn, (double)G.speed, (double)h, nearId);
 			}
 		}
 	}
@@ -664,15 +664,15 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 }
 
 // ===========================================================================
-// Physics-step hook
+// Physics-step hook (GD 2.2081 signature: dt, isHalfTick, isLastTick)
 // ===========================================================================
 class $modify(BotGame, GJBaseGameLayer) {
-	void processCommands(float dt) {
+	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
 		auto pl = PlayLayer::get();
 		if (pl && static_cast<GJBaseGameLayer*>(pl) == this) {
 			botStep(this, pl, dt);
 		}
-		GJBaseGameLayer::processCommands(dt);
+		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 	}
 };
 
@@ -827,7 +827,7 @@ class $modify(BotPlay, PlayLayer) {
 			if (u.first < px || u.first > px + 900.f) continue;
 			drawRect({u.first, 0.f, u.first + 30.f, 900.f}, {1.f, 0.5f, 0.f, 0.35f});
 		}
-		// Committed plan path (green).
+		// Committed plan path (green = wait, white = press).
 		if (G.plan.valid) {
 			CCPoint prev = m_player1->getPosition();
 			for (size_t i = G.plan.idx; i < G.plan.px.size(); ++i) {
