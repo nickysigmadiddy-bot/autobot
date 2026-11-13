@@ -8,9 +8,9 @@
     },
     "id": "yourname.autobot",
     "name": "AutoBot",
-    "version": "v0.5.0",
+    "version": "v0.6.0",
     "developer": "yourname",
-    "description": "Cube bot with step-aligned exact search, committed plans, prediction audit and death forensics.",
+    "description": "Cube bot with step-aligned exact search, committed plans, measured physics, prediction audit and death forensics.",
     "settings": {
         "enabled": {
             "type": "bool",
@@ -33,7 +33,7 @@
         "beam-width": {
             "type": "int",
             "name": "Search budget",
-            "description": "Max simulated steps per search = this value x 1500 (also capped at 5 ms per search). Higher can find plans in dense sections but costs more CPU.",
+            "description": "Max simulated steps per search = this value x 1500 (also capped at 2 ms per search).",
             "default": 100,
             "min": 16,
             "max": 300
