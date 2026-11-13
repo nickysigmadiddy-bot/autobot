@@ -13,38 +13,18 @@
 using namespace geode::prelude;
 
 // ===========================================================================
-// AutoBot v0.5 - cube only, step-aligned, exact search, committed plans.
-//
-//  * Runs once per PHYSICS STEP (GJBaseGameLayer::processCommands), not once
-//    per rendered frame, so 144+ fps / any TPS gives the same behaviour.
-//  * Exact depth-first search over "wait / tap" decisions (no beam, no
-//    clearance score). A plan is accepted only if it survives the whole
-//    horizon. Among survivors it prefers no clicks, and centres the first
-//    jump inside its feasible timing window instead of hugging the edge.
-//  * Plan commitment: the plan is followed until it runs low or reality
-//    diverges from the sim; no per-frame re-planning, no dithering.
-//  * Prediction audit: predicted vs real position every step; the first
-//    divergence of an attempt is logged with context.
-//  * Unsupported objects ahead (slopes, other portals/orbs...) stop the
-//    plan before them and are shown on the HUD instead of being ignored.
-//  * Death forensics: classifies deaths (model error / dead end / unseen)
-//    and remembers the bad click position (forbidden band), instead of
-//    inflating hazard margins.
-//
-// Settings reused: horizon (frames @60fps), beam-width (now = search budget,
-// width*1500 sim steps), hazard-margin, learn-from-deaths, debug-draw,
-// use-orbs, practice-only, enabled.
+// AutoBot v0.5.1 - cube only, step-aligned, exact search, committed plans.
+// v0.5.1: performance pass (cached debug drawing, throttled HUD, 2 ms search
+// cap, replan cooldown after divergence).
 // ===========================================================================
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 constexpr float BASE_SPEED = 311.58f;
-constexpr double SEARCH_MS_LIMIT = 5.0;   // hard cap per search
+constexpr double SEARCH_MS_LIMIT = 2.0;   // hard cap per search
 constexpr float DIV_TOL = 0.8f;           // prediction divergence (units)
+constexpr int DIV_COOLDOWN = 20;          // steps between divergence replans
 namespace phys {
 	constexpr float HALF = 15.f;
-	constexpr float GRAVITY = 0.958199f;  // per frame^2 (1 frame = 1/60 s)
+	constexpr float GRAVITY = 0.958199f;
 	constexpr float JUMP = 11.180032f;
 	constexpr float FALL_MAX = 15.f;
 	constexpr float SPEEDS[5] = {251.16f, 311.58f, 387.42f, 468.0f, 576.0f};
@@ -90,7 +70,6 @@ struct Obj {
 
 static bool isOrbId(int id) { return id == 36 || id == 141 || id == 1333; }
 static bool isPadId(int id) { return id == 35 || id == 140 || id == 1332; }
-// Supported portals: cube(12), gravity(10/11), speeds.
 static bool isPortalId(int id) {
 	switch (id) {
 		case 10: case 11: case 12:
@@ -99,17 +78,16 @@ static bool isPortalId(int id) {
 	}
 	return false;
 }
-// Things the sim cannot model yet. The plan stops before them.
 static bool isUnsupportedId(int id) {
 	switch (id) {
-		case 13:                               // ship portal
-		case 47: case 111: case 660: case 745: // ball, ufo, wave, robot
-		case 1331: case 2926:                  // spider, swing
-		case 286: case 287:                    // dual, solo
-		case 101: case 99:                     // mini, big
-		case 45: case 46: case 747:            // mirror, teleport
-		case 67: case 84: case 1022: case 1330:// blue pad/orb, green, black orb
-		case 1704: case 1751: case 1594:       // dash orbs, spider orb
+		case 13:
+		case 47: case 111: case 660: case 745:
+		case 1331: case 2926:
+		case 286: case 287:
+		case 101: case 99:
+		case 45: case 46: case 747:
+		case 67: case 84: case 1022: case 1330:
+		case 1704: case 1751: case 1594:
 			return true;
 	}
 	return false;
@@ -123,11 +101,11 @@ static std::vector<Obj>::iterator lowerBoundX(std::vector<Obj>& v, float x0) {
 }
 
 // ---------------------------------------------------------------------------
-// Simulator (cube, one physics step of h frames per call)
+// Simulator
 // ---------------------------------------------------------------------------
 struct Sim {
 	float x = 0.f;
-	float y = 0.f;      // normalized: gravity always pulls toward -y
+	float y = 0.f;
 	float vy = 0.f;
 	float sgn = 1.f;
 	float speed = BASE_SPEED;
@@ -136,16 +114,16 @@ struct Sim {
 	uint64_t mask = 0;
 };
 
-struct Band { float x, y; };   // forbidden click position (world coords)
+struct Band { float x, y; };
 
 struct Env {
-	std::vector<Obj> loc;          // sorted by x0
-	float maxW = 30.f;             // widest object in loc
+	std::vector<Obj> loc;
+	float maxW = 30.f;
 	float floorY = 90.f;
 	float ceilY = 390.f;
 	float margin = 2.f;
-	float h = 0.25f;               // frames per physics step
-	float limitX = 1e9f;           // planning stops here (unsupported ahead)
+	float h = 0.25f;
+	float limitX = 1e9f;
 	bool useOrbs = true;
 	std::vector<Band> const* forbid = nullptr;
 };
@@ -178,7 +156,6 @@ static void applyPortal(Sim& s, int id) {
 	}
 }
 
-// One physics step. false = crashed.
 static bool stepFrame(Sim& s, bool press, Env const& e) {
 	using namespace phys;
 	bool edge = press && !s.held;
@@ -269,9 +246,7 @@ static bool canPress(Sim const& s, Env const& e) {
 }
 
 // ---------------------------------------------------------------------------
-// Exact search. Actions per physics step: 0 = release, 1 = press (a tap).
-// Choices only exist on ground or while touching an unused orb. The "wait"
-// branch is tried first, so the bot never clicks when it does not have to.
+// Exact search
 // ---------------------------------------------------------------------------
 using Clock = std::chrono::steady_clock;
 
@@ -302,14 +277,13 @@ struct Searcher {
 	bool stop() {
 		if (timeUp) return true;
 		if (++nodes > budget) { timeUp = true; return true; }
-		if ((nodes & 255) == 0) {
+		if ((nodes & 127) == 0) {
 			double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 			if (ms > SEARCH_MS_LIMIT) { timeUp = true; return true; }
 		}
 		return false;
 	}
 
-	// true = a path surviving to the horizon exists (it is left in `path`).
 	bool dfs(Sim s, int t) {
 		size_t base = path.size();
 		for (;;) {
@@ -351,12 +325,11 @@ struct Searcher {
 
 struct Plan {
 	std::vector<uint8_t> acts;
-	std::vector<float> px, py;   // predicted world position AFTER each step
-	std::vector<float> pvy;
+	std::vector<float> px, py;
 	size_t idx = 0;
 	bool valid = false;
-	bool full = false;           // survives the whole horizon
-	bool clipped = false;        // ended at an unsupported object
+	bool full = false;
+	bool clipped = false;
 };
 
 static void makePlan(Sim const& s0, Env const& e, int H, long budget, Plan& out) {
@@ -368,8 +341,6 @@ static void makePlan(Sim const& s0, Env const& e, int H, long budget, Plan& out)
 	bool ok = S.dfs(s0, 0);
 	std::vector<uint8_t> acts = ok ? S.path : S.bestPath;
 
-	// Centre the first jump inside its feasible window (never clicks later
-	// than the latest feasible step, at most ~8 frames earlier).
 	if (ok && !S.timeUp) {
 		auto it = std::find(acts.begin(), acts.end(), (uint8_t)1);
 		if (it != acts.end()) {
@@ -402,13 +373,12 @@ static void makePlan(Sim const& s0, Env const& e, int H, long budget, Plan& out)
 	}
 
 	out.acts = acts;
-	out.px.clear(); out.py.clear(); out.pvy.clear();
+	out.px.clear(); out.py.clear();
 	Sim s = s0;
 	for (auto a : acts) {
 		if (!stepFrame(s, a == 1, e)) break;
 		out.px.push_back(s.x);
 		out.py.push_back(s.y * s.sgn);
-		out.pvy.push_back(s.vy);
 	}
 	out.acts.resize(out.px.size());
 	out.idx = 0;
@@ -418,13 +388,13 @@ static void makePlan(Sim const& s0, Env const& e, int H, long budget, Plan& out)
 }
 
 // ===========================================================================
-// Bot state (global: shared by the physics-step hook and the PlayLayer hook)
+// Bot state
 // ===========================================================================
 struct Rec { float x, y, vN, predY, err; bool gr, act; };
 
 struct Bot {
 	std::vector<Obj> objs;
-	std::vector<std::pair<float, int>> unsup;   // x0, id (sorted)
+	std::vector<std::pair<float, int>> unsup;
 	Plan plan;
 	Env dbgEnv;
 
@@ -440,6 +410,7 @@ struct Bot {
 	float err = 0.f, maxErr = 0.f;
 	bool diverged = false;
 	bool forceReplan = false;
+	int cool = 0;                 // divergence-replan cooldown (steps)
 
 	float floorY = 90.f, ceilY = 390.f;
 	bool ceilLearned = false;
@@ -457,6 +428,10 @@ struct Bot {
 	CCLabelBMFont* hud = nullptr;
 	bool active = false;
 	char const* modeStr = "cube";
+
+	int drawVer = 0, drawnVer = -1;   // debug overlay cache
+	int hudTick = 0;
+	std::string lastHud;
 };
 static Bot G;
 
@@ -479,8 +454,7 @@ static void setHold(GJBaseGameLayer* gl, bool want, PlayerObject* p) {
 }
 
 // ---------------------------------------------------------------------------
-// One bot decision per physics step. Called BEFORE the game processes the
-// step, so the player state is the result of the previous step.
+// One bot decision per physics step
 // ---------------------------------------------------------------------------
 static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 	auto mod = Mod::get();
@@ -497,7 +471,7 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 	}
 	G.active = true;
 
-	if (!isCube(p)) {                       // cube only for now
+	if (!isCube(p)) {
 		releaseBtn(gl);
 		G.prevX = -1.f; G.havePred = false; G.plan.valid = false;
 		return;
@@ -505,14 +479,15 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 
 	auto pos = p->getPosition();
 	float sgn = p->m_isUpsideDown ? -1.f : 1.f;
-	float h = dt * 60.f;                    // frames per physics step
+	float h = dt * 60.f;
 	bool fresh = G.prevX < 0.f;
+	if (G.cool > 0) --G.cool;
 
 	// ---- telemetry --------------------------------------------------------
 	float v = static_cast<float>(p->m_yVelocity);
 	if (!fresh) {
 		float dy = pos.y - G.prevY;
-		if (std::abs(dy) > 0.02f && std::abs(v) > 0.3f && dy * v < 0.f) v = -v; // sign guard
+		if (std::abs(dy) > 0.02f && std::abs(v) > 0.3f && dy * v < 0.f) v = -v;
 	}
 	float vN = v * sgn;
 
@@ -538,7 +513,7 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 		G.err = ey;
 		G.maxErr = std::max(G.maxErr, std::abs(ey));
 		if (stepErr > DIV_TOL) {
-			G.forceReplan = true;
+			if (G.cool == 0) { G.forceReplan = true; G.cool = DIV_COOLDOWN; }
 			if (!G.diverged) {
 				G.diverged = true;
 				int nearId = -1;
@@ -554,7 +529,7 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 	}
 	G.havePred = false;
 
-	// ---- learn floor / ceiling (resting on the real one, not a block) -------
+	// ---- learn floor / ceiling ---------------------------------------------
 	auto solidIn = [&](Rc q) {
 		for (auto it = lowerBoundX(G.objs, pos.x - 200.f); it != G.objs.end() && it->r.x0 < pos.x + 40.f; ++it) {
 			if (it->k == K_SOLID && hit(q, it->r)) return true;
@@ -584,7 +559,7 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 	G.prevX = pos.x; G.prevY = pos.y; G.prevH = h;
 	if (G.sincePress < 1000000) ++G.sincePress;
 
-	// ---- unsupported-mechanic detection -----------------------------------------
+	// ---- unsupported-mechanic detection --------------------------------------
 	G.ahead.clear();
 	float limitX = 1e9f;
 	for (auto const& u : G.unsup) {
@@ -596,13 +571,12 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 		break;
 	}
 
-	// ---- decide whether to (re)plan -----------------------------------------------
+	// ---- decide whether to (re)plan -------------------------------------------
 	int H = std::clamp<int>(static_cast<int>(mod->getSettingValue<int64_t>("horizon")), 10, 62);
-	int Hs = std::max(8, (int)std::ceil((float)H / h));       // horizon in physics steps
+	int Hs = std::max(8, (int)std::ceil((float)H / h));
 	size_t remaining = G.plan.valid ? (G.plan.acts.size() > G.plan.idx ? G.plan.acts.size() - G.plan.idx : 0) : 0;
 	bool need = !G.plan.valid || G.forceReplan || fresh ||
 	            (G.plan.full ? remaining <= (size_t)(Hs / 2) : remaining == 0);
-	// A plan that ended at an unsupported object cannot get longer: only re-plan when it runs out.
 	if (G.plan.valid && G.plan.clipped && !G.forceReplan && !fresh && remaining > 0) need = false;
 
 	if (need) {
@@ -642,9 +616,10 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 		G.forceReplan = false;
 		++G.replans;
 		G.dbgEnv = env;
+		++G.drawVer;               // tell the overlay to redraw once
 	}
 
-	// ---- execute the committed plan --------------------------------------------------
+	// ---- execute the committed plan --------------------------------------------
 	bool act = false;
 	float predNY = pos.y;
 	if (G.plan.valid && G.plan.idx < G.plan.acts.size()) {
@@ -664,7 +639,7 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 }
 
 // ===========================================================================
-// Physics-step hook (GD 2.2081 signature: dt, isHalfTick, isLastTick)
+// Physics-step hook (GD 2.2081)
 // ===========================================================================
 class $modify(BotGame, GJBaseGameLayer) {
 	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
@@ -677,7 +652,7 @@ class $modify(BotGame, GJBaseGameLayer) {
 };
 
 // ===========================================================================
-// PlayLayer hook: level setup, reset, death forensics, HUD
+// PlayLayer hook
 // ===========================================================================
 class $modify(BotPlay, PlayLayer) {
 	void setupHasCompleted() {
@@ -713,6 +688,7 @@ class $modify(BotPlay, PlayLayer) {
 
 		G.debug = CCDrawNode::create();
 		m_objectLayer->addChild(G.debug, 1000);
+		G.drawVer = 0; G.drawnVer = -1;
 
 		G.hud = CCLabelBMFont::create("AutoBot", "bigFont.fnt");
 		G.hud->setScale(0.35f);
@@ -721,6 +697,7 @@ class $modify(BotPlay, PlayLayer) {
 		auto win = CCDirector::get()->getWinSize();
 		G.hud->setPosition({6.f, win.height - 6.f});
 		this->addChild(G.hud, 1000);
+		G.lastHud.clear();
 	}
 
 	void onQuit() {
@@ -741,7 +718,9 @@ class $modify(BotPlay, PlayLayer) {
 		G.plan.valid = false;
 		G.diverged = false;
 		G.err = 0.f;
+		G.cool = 0;
 		G.sincePress = 1000000;
+		++G.drawVer;
 	}
 
 	void destroyPlayer(PlayerObject* player, GameObject* object) {
@@ -752,7 +731,6 @@ class $modify(BotPlay, PlayLayer) {
 		PlayLayer::destroyPlayer(player, object);
 	}
 
-	// Death forensics: classify why we died and remember the bad click.
 	void onDeath(GameObject* killer) {
 		auto pos = m_player1->getPosition();
 		++G.deaths;
@@ -775,7 +753,6 @@ class $modify(BotPlay, PlayLayer) {
 		}
 
 		if (!Mod::get()->getSettingValue<bool>("learn-from-deaths")) return;
-		// Real learning: never click at that exact spot again.
 		if (addBand && G.sincePress < (int)(40.f * 4.f)) {
 			if (G.forbid.size() >= 64) G.forbid.erase(G.forbid.begin());
 			G.forbid.push_back({G.pressX, G.pressY});
@@ -790,8 +767,12 @@ class $modify(BotPlay, PlayLayer) {
 		drawDebug();
 	}
 
+	// HUD: rebuilt at most ~8x per second, and only if the text changed.
 	void updateHud() {
 		if (!G.hud) return;
+		if (++G.hudTick < 8) return;
+		G.hudTick = 0;
+
 		char buf[256];
 		std::snprintf(buf, sizeof(buf), "AutoBot %s | %s%s | clk %d dth %d | plan %d%s | replans %d | err %.2f (max %.2f) | %.1fms (max %.1f)",
 			G.active ? "ON" : "OFF", G.modeStr, (G.active && !isCube(m_player1)) ? " (cube only)" : "",
@@ -801,14 +782,23 @@ class $modify(BotPlay, PlayLayer) {
 			G.replans, (double)G.err, (double)G.maxErr, G.lastMs, G.maxMs);
 		std::string s = buf;
 		if (!G.ahead.empty()) s += " | " + G.ahead;
+		if (s == G.lastHud) return;
+		G.lastHud = s;
 		G.hud->setString(s.c_str());
 	}
 
+	// Debug overlay: rebuilt only when a new plan was made, never per frame.
 	void drawDebug() {
 		auto d = G.debug;
 		if (!d) return;
+		bool want = G.active && Mod::get()->getSettingValue<bool>("debug-draw");
+		if (!want) {
+			if (G.drawnVer != -2) { d->clear(); G.drawnVer = -2; }
+			return;
+		}
+		if (G.drawnVer == G.drawVer) return;
+		G.drawnVer = G.drawVer;
 		d->clear();
-		if (!G.active || !Mod::get()->getSettingValue<bool>("debug-draw")) return;
 
 		auto drawRect = [&](Rc const& r, ccColor4F col) {
 			CCPoint v[4] = {{r.x0, r.y0}, {r.x1, r.y0}, {r.x1, r.y1}, {r.x0, r.y1}};
@@ -823,16 +813,18 @@ class $modify(BotPlay, PlayLayer) {
 			                                : ccColor4F{1.f, 0.9f, 0.2f, 1.f};
 			drawRect(o.r, col);
 		}
-		for (auto const& u : G.unsup) {          // orange: things the bot cannot model
+		for (auto const& u : G.unsup) {
 			if (u.first < px || u.first > px + 900.f) continue;
 			drawRect({u.first, 0.f, u.first + 30.f, 900.f}, {1.f, 0.5f, 0.f, 0.35f});
 		}
-		// Committed plan path (green = wait, white = press).
-		if (G.plan.valid) {
-			CCPoint prev = m_player1->getPosition();
-			for (size_t i = G.plan.idx; i < G.plan.px.size(); ++i) {
+		// Planned path: one point every 4 steps (plus every click), green = wait, white = click.
+		if (G.plan.valid && !G.plan.px.empty()) {
+			CCPoint prev = {G.plan.px[0], G.plan.py[0]};
+			for (size_t i = 1; i < G.plan.px.size(); ++i) {
+				bool click = G.plan.acts[i] != 0;
+				if (!click && (i % 4) != 0 && i + 1 != G.plan.px.size()) continue;
 				CCPoint cur = {G.plan.px[i], G.plan.py[i]};
-				d->drawSegment(prev, cur, 1.2f, G.plan.acts[i] ? ccColor4F{1.f, 1.f, 1.f, 1.f} : ccColor4F{0.2f, 1.f, 0.4f, 1.f});
+				d->drawSegment(prev, cur, 1.2f, click ? ccColor4F{1.f, 1.f, 1.f, 1.f} : ccColor4F{0.2f, 1.f, 0.4f, 1.f});
 				prev = cur;
 			}
 		}
