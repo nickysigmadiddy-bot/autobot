@@ -8,28 +8,29 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 using namespace geode::prelude;
 
 // ===========================================================================
-// AutoBot v0.6.0 - cube only, step-aligned, exact search, committed plans.
-// v0.6.0: measured cube physics (jump 11.18, gravity 0.864/frame^2, position
-// scale 0.9), safe floor learning, anti-cheat/phantom death filter, log rate
-// limiting, cached settings, time-throttled HUD and overlay.
+// AutoBot v0.6.1 - cube only, step-aligned, exact search, committed plans.
+// v0.6.1: fixed-rate planning (max 240 steps/s) independent of render FPS,
+// sub-step skipping at very high FPS, pruned search, allocation-free dead
+// table, reused planner environment, throttled HUD/overlay/settings.
 // ===========================================================================
 
 constexpr float BASE_SPEED = 311.58f;
-constexpr double SEARCH_MS_LIMIT = 2.0;
+constexpr double SEARCH_MS_FULL = 2.0;
+constexpr double SEARCH_MS_DEADEND = 1.0;
 constexpr float DIV_TOL = 0.8f;
-constexpr int DIV_COOLDOWN = 20;
+constexpr int DIV_COOLDOWN = 24;
+constexpr float MIN_PLAN_H = 0.25f;   // 240 steps per second at most
 namespace phys {
 	constexpr float HALF = 15.f;
-	constexpr float GRAVITY = 0.864f;     // velocity loss per frame (1/60 s), measured
-	constexpr float JUMP = 11.18f;        // measured
-	constexpr float POS_SCALE = 0.9f;     // y += vy * h * POS_SCALE, measured
-	constexpr float FALL_MAX = 15.f;      // unverified
+	constexpr float GRAVITY = 0.864f;
+	constexpr float JUMP = 11.18f;
+	constexpr float POS_SCALE = 0.9f;
+	constexpr float FALL_MAX = 15.f;
 	constexpr float SPEEDS[5] = {251.16f, 311.58f, 387.42f, 468.0f, 576.0f};
 	constexpr float PSPEEDS[5] = {0.7f, 0.9f, 1.1f, 1.3f, 1.6f};
 }
@@ -50,7 +51,7 @@ static char const* modeName(PlayerObject* p) {
 }
 
 // ---------------------------------------------------------------------------
-// Settings cache (refreshed every 60 steps instead of every step)
+// Settings cache
 // ---------------------------------------------------------------------------
 struct Cfg {
 	bool enabled = true, practiceOnly = true, useOrbs = true, debugDraw = true, learn = true;
@@ -272,6 +273,50 @@ static bool canPress(Sim const& s, Env const& e) {
 	return true;
 }
 
+// A click can only matter if some non-portal object is close enough ahead.
+static bool pressRelevant(Sim const& s, Env const& e) {
+	for (size_t i = firstIdx(e, s.x); i < e.loc.size(); ++i) {
+		auto const& o = e.loc[i];
+		if (o.r.x0 > s.x + 360.f) break;
+		if (o.k != K_PORTAL && o.r.x1 > s.x - 40.f) return true;
+	}
+	return false;
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-size dead-state table (no allocation after construction)
+// ---------------------------------------------------------------------------
+struct DeadSet {
+	static constexpr size_t N = 1u << 15;
+	static constexpr size_t MASK = N - 1;
+	std::vector<uint64_t> keys;
+	std::vector<uint32_t> stamp;
+	uint32_t cur = 1;
+	size_t cnt = 0;
+	DeadSet() : keys(N, 0), stamp(N, 0) {}
+	void clear() {
+		if (++cur == 0) { std::fill(stamp.begin(), stamp.end(), 0u); cur = 1; }
+		cnt = 0;
+	}
+	bool has(uint64_t k) const {
+		size_t i = (size_t)(k ^ (k >> 29)) & MASK;
+		while (stamp[i] == cur) {
+			if (keys[i] == k) return true;
+			i = (i + 1) & MASK;
+		}
+		return false;
+	}
+	void add(uint64_t k) {
+		if (cnt * 10 > N * 6) return;
+		size_t i = (size_t)(k ^ (k >> 29)) & MASK;
+		while (stamp[i] == cur) {
+			if (keys[i] == k) return;
+			i = (i + 1) & MASK;
+		}
+		stamp[i] = cur; keys[i] = k; ++cnt;
+	}
+};
+
 // ---------------------------------------------------------------------------
 // Exact search
 // ---------------------------------------------------------------------------
@@ -282,9 +327,10 @@ struct Searcher {
 	int H = 0;
 	long budget = 0;
 	long nodes = 0;
+	double msLimit = SEARCH_MS_FULL;
 	bool timeUp = false;
 	Clock::time_point t0;
-	std::unordered_set<uint64_t> dead;
+	DeadSet dead;
 	std::vector<uint8_t> path;
 	int bestT = -1;
 	std::vector<uint8_t> bestPath;
@@ -304,9 +350,9 @@ struct Searcher {
 	bool stop() {
 		if (timeUp) return true;
 		if (++nodes > budget) { timeUp = true; return true; }
-		if ((nodes & 127) == 0) {
+		if ((nodes & 63) == 0) {
 			double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-			if (ms > SEARCH_MS_LIMIT) { timeUp = true; return true; }
+			if (ms > msLimit) { timeUp = true; return true; }
 		}
 		return false;
 	}
@@ -318,7 +364,8 @@ struct Searcher {
 			if (t > bestT) { bestT = t; bestPath = path; }
 			if (stop()) { path.resize(base); return false; }
 
-			bool choice = s.ground || touchingOrb(s, *e);
+			bool orb = touchingOrb(s, *e);
+			bool choice = s.ground || orb;
 			if (!choice) {
 				if (!stepFrame(s, false, *e)) { path.resize(base); return false; }
 				path.push_back(0);
@@ -327,7 +374,7 @@ struct Searcher {
 			}
 
 			uint64_t k = keyOf(s, t);
-			if (dead.count(k)) { path.resize(base); return false; }
+			if (dead.has(k)) { path.resize(base); return false; }
 
 			Sim w = s;
 			if (stepFrame(w, false, *e)) {
@@ -335,7 +382,7 @@ struct Searcher {
 				if (dfs(w, t + 1)) return true;
 				path.pop_back();
 			}
-			if (!timeUp && canPress(s, *e)) {
+			if (!timeUp && canPress(s, *e) && (orb || pressRelevant(s, *e))) {
 				Sim p = s;
 				if (stepFrame(p, true, *e)) {
 					path.push_back(1);
@@ -343,7 +390,7 @@ struct Searcher {
 					path.pop_back();
 				}
 			}
-			if (!timeUp) dead.insert(k);
+			if (!timeUp) dead.add(k);
 			path.resize(base);
 			return false;
 		}
@@ -359,9 +406,10 @@ struct Plan {
 	bool clipped = false;
 };
 
-static void makePlan(Sim const& s0, Env const& e, int H, long budget, Plan& out) {
+static void makePlan(Sim const& s0, Env const& e, int H, long budget, double msLimit, Plan& out) {
 	static Searcher S;
 	S.e = &e; S.H = H; S.budget = budget; S.nodes = 0; S.timeUp = false;
+	S.msLimit = msLimit;
 	S.t0 = Clock::now();
 	S.dead.clear(); S.path.clear(); S.bestT = -1; S.bestPath.clear();
 
@@ -373,6 +421,7 @@ static void makePlan(Sim const& s0, Env const& e, int H, long budget, Plan& out)
 		if (it != acts.end()) {
 			int p0 = (int)(it - acts.begin());
 			std::vector<Sim> pre;
+			pre.reserve((size_t)p0);
 			Sim s = s0;
 			for (int i = 0; i < p0; ++i) { pre.push_back(s); stepFrame(s, false, e); }
 			int back = std::max(1, (int)(8.f / e.h));
@@ -401,6 +450,7 @@ static void makePlan(Sim const& s0, Env const& e, int H, long budget, Plan& out)
 
 	out.acts = acts;
 	out.px.clear(); out.py.clear();
+	out.px.reserve(acts.size()); out.py.reserve(acts.size());
 	Sim s = s0;
 	for (auto a : acts) {
 		if (!stepFrame(s, a == 1, e)) break;
@@ -423,12 +473,14 @@ struct Bot {
 	std::vector<Obj> objs;
 	std::vector<std::pair<float, int>> unsup;
 	Plan plan;
-	Env dbgEnv;
+	Env dbgEnv;          // also used as the planner's working environment
 
 	bool holding = false, pressedLast = false;
 	int clicks = 0, deaths = 0, phantom = 0, replans = 0;
 
-	float prevX = -1.f, prevY = 0.f, prevH = 0.25f;
+	float prevX = -1.f, prevY = 0.f;
+	float sinceTick = 0.f;   // real frames (1/60 s) elapsed since the last bot tick
+	float planH = 0.25f;
 	float speed = BASE_SPEED;
 
 	bool havePred = false;
@@ -455,6 +507,7 @@ struct Bot {
 	bool active = false;
 	char const* modeStr = "cube";
 
+	unsigned frameCtr = 0;
 	int drawVer = 0, drawnVer = -1;
 	Clock::time_point lastHudT{}, lastDrawT{}, lastDeathLogT{};
 	std::string lastHud;
@@ -479,35 +532,47 @@ static void setHold(GJBaseGameLayer* gl, bool want, PlayerObject* p) {
 	gl->handleButton(want, 1, true);
 }
 
+static void resetTracking() {
+	G.prevX = -1.f; G.havePred = false; G.plan.valid = false; G.sinceTick = 0.f;
+}
+
 // ---------------------------------------------------------------------------
-// One bot decision per physics step
+// One bot decision per planning tick (never faster than 240 per second)
 // ---------------------------------------------------------------------------
 static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
-	if (++C.age >= 60) refreshCfg();
+	if (++C.age >= 240) refreshCfg();
 	auto p = pl->m_player1;
 
 	bool on = C.enabled;
 	if (C.practiceOnly && !pl->m_isPracticeMode) on = false;
 	G.modeStr = modeName(p);
-	if (!on || p->m_isDead || dt <= 1e-5f || dt > 0.05f) {
+	if (!on || p->m_isDead || dt <= 1e-6f || dt > 0.05f) {
 		G.active = false;
 		releaseBtn(gl);
-		G.prevX = -1.f; G.havePred = false; G.plan.valid = false;
+		resetTracking();
 		return;
 	}
 	G.active = true;
 
 	if (!isCube(p)) {
 		releaseBtn(gl);
-		G.prevX = -1.f; G.havePred = false; G.plan.valid = false;
+		resetTracking();
 		return;
 	}
 
+	// ---- tick gating: plan at max 240 steps/s no matter the render FPS -------
+	float hRaw = dt * 60.f;
+	G.sinceTick += hRaw;
+	bool fresh = G.prevX < 0.f;
+	float h = std::max(MIN_PLAN_H, std::round(hRaw * 4.f) / 4.f);
+	if (!fresh && G.sinceTick < h - 0.02f) return;   // sub-step: keep current input
+	float elapsed = fresh ? h : G.sinceTick;
+	G.sinceTick = 0.f;
+
 	auto pos = p->getPosition();
 	float sgn = p->m_isUpsideDown ? -1.f : 1.f;
-	float h = dt * 60.f;
-	bool fresh = G.prevX < 0.f;
 	if (G.cool > 0) --G.cool;
+	if (G.plan.valid && std::abs(G.planH - h) > 0.01f) G.forceReplan = true;
 
 	// ---- telemetry --------------------------------------------------------
 	float v = static_cast<float>(p->m_yVelocity);
@@ -525,7 +590,7 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 		}
 		G.speed = phys::SPEEDS[bi];
 	} else {
-		float sp = (pos.x - G.prevX) / (G.prevH / 60.f);
+		float sp = (pos.x - G.prevX) / (elapsed / 60.f);
 		for (float t : phys::SPEEDS) {
 			if (std::abs(sp - t) < t * 0.06f) { G.speed = t; break; }
 		}
@@ -555,7 +620,7 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 	}
 	G.havePred = false;
 
-	// ---- learn floor / ceiling (only plausible values, never from blocks) ----
+	// ---- learn floor / ceiling ----------------------------------------------
 	auto solidIn = [&](Rc q) {
 		for (auto it = lowerBoundX(G.objs, pos.x - 200.f); it != G.objs.end() && it->r.x0 < pos.x + 40.f; ++it) {
 			if (it->k == K_SOLID && hit(q, it->r)) return true;
@@ -586,10 +651,10 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 		}
 	}
 	G.pressedLast = false;
-	G.prevX = pos.x; G.prevY = pos.y; G.prevH = h;
+	G.prevX = pos.x; G.prevY = pos.y;
 	if (G.sincePress < 1000000) ++G.sincePress;
 
-	// ---- unsupported-mechanic detection (binary search, no string work) -------
+	// ---- unsupported-mechanic detection ---------------------------------------
 	float limitX = 1e9f;
 	G.aheadId = -1;
 	{
@@ -610,7 +675,10 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 	if (G.plan.valid && G.plan.clipped && !G.forceReplan && !fresh && remaining > 0) need = false;
 
 	if (need) {
-		Env env;
+		bool wasFull = G.plan.valid && G.plan.full;
+		Env& env = G.dbgEnv;
+		env.loc.clear();
+		env.maxW = 30.f;
 		env.floorY = G.floorY;
 		env.ceilY = G.ceilLearned ? G.ceilY : G.floorY + 300.f;
 		env.margin = C.margin;
@@ -638,13 +706,14 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 			env.loc.push_back(o);
 		}
 
+		double lim = (fresh || wasFull || !G.plan.valid) ? SEARCH_MS_FULL : SEARCH_MS_DEADEND;
 		auto t0 = Clock::now();
-		makePlan(s0, env, Hs, C.budget, G.plan);
+		makePlan(s0, env, Hs, C.budget, lim, G.plan);
 		G.lastMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 		G.maxMs = std::max(G.maxMs, G.lastMs);
 		G.forceReplan = false;
+		G.planH = h;
 		++G.replans;
-		G.dbgEnv = env;
 		++G.drawVer;
 	}
 
@@ -667,7 +736,7 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 }
 
 // ===========================================================================
-// Physics-step hook (GD 2.2081: dt, isHalfTick, isLastTick)
+// Physics-step hook
 // ===========================================================================
 class $modify(BotGame, GJBaseGameLayer) {
 	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
@@ -703,6 +772,8 @@ class $modify(BotPlay, PlayLayer) {
 		G.forbid.clear();
 		G.plan = Plan();
 		G.floorY = 90.f; G.ceilY = 390.f; G.ceilLearned = false;
+		G.sinceTick = 0.f;
+		G.dbgEnv.loc.reserve(512);
 
 		if (m_objects) {
 			for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
@@ -739,7 +810,7 @@ class $modify(BotPlay, PlayLayer) {
 		this->addChild(G.hud, 1000);
 		G.lastHud.clear();
 
-		log::info("[AutoBot] v0.6.0 ready: {} objects, {} unsupported. Physics: jump=11.18 gravity=0.864/frame posScale=0.9",
+		log::info("[AutoBot] v0.6.1 ready: {} objects, {} unsupported. Planning at <=240 steps/s.",
 			G.objs.size(), G.unsup.size());
 	}
 
@@ -762,6 +833,7 @@ class $modify(BotPlay, PlayLayer) {
 		G.diverged = false;
 		G.err = 0.f;
 		G.cool = 0;
+		G.sinceTick = 0.f;
 		G.sincePress = 1000000;
 		++G.drawVer;
 	}
@@ -776,8 +848,6 @@ class $modify(BotPlay, PlayLayer) {
 	void onDeath(GameObject* killer) {
 		auto pos = m_player1->getPosition();
 
-		// Deaths with no level object near the player are not spikes (GD's anti-cheat
-		// spike or another mod). Ignore them quietly and rarely log them.
 		if (!nearKnownObject(pos.x, pos.y)) {
 			++G.phantom;
 			if (G.phantom <= 3 || G.phantom % 50 == 0) {
@@ -821,11 +891,12 @@ class $modify(BotPlay, PlayLayer) {
 
 	void postUpdate(float dt) {
 		PlayLayer::postUpdate(dt);
+		// Render FPS can be thousands; only do UI work on every 8th frame.
+		if ((++G.frameCtr & 7u) != 0u) return;
 		updateHud();
 		drawDebug();
 	}
 
-	// HUD: at most 4x per second, only if the text changed.
 	void updateHud() {
 		if (!G.hud) return;
 		auto now = Clock::now();
@@ -850,7 +921,6 @@ class $modify(BotPlay, PlayLayer) {
 		G.hud->setString(s.c_str());
 	}
 
-	// Debug overlay: rebuilt only after a new plan, at most ~6x per second, nearby objects only.
 	void drawDebug() {
 		auto d = G.debug;
 		if (!d) return;
@@ -888,7 +958,7 @@ class $modify(BotPlay, PlayLayer) {
 			CCPoint prev = {G.plan.px[0], G.plan.py[0]};
 			for (size_t i = 1; i < G.plan.px.size(); ++i) {
 				bool click = G.plan.acts[i] != 0;
-				if (!click && (i % 6) != 0 && i + 1 != G.plan.px.size()) continue;
+				if (!click && (i % 12) != 0 && i + 1 != G.plan.px.size()) continue;
 				CCPoint cur = {G.plan.px[i], G.plan.py[i]};
 				d->drawSegment(prev, cur, 1.2f, click ? ccColor4F{1.f, 1.f, 1.f, 1.f} : ccColor4F{0.2f, 1.f, 0.4f, 1.f});
 				prev = cur;
