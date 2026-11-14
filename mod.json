@@ -8,7 +8,7 @@
     },
     "id": "yourname.autobot",
     "name": "AutoBot",
-    "version": "v0.6.0",
+    "version": "v0.7.0",
     "developer": "yourname",
     "description": "Cube bot with step-aligned exact search, committed plans, measured physics, prediction audit and death forensics.",
     "settings": {
