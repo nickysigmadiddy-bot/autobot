@@ -32,9 +32,8 @@ using namespace geode::prelude;
 // ===========================================================================
 
 constexpr float BASE_SPEED = 311.58f;
-constexpr float STEP_QUANT = 32.f;               // sim step is quantised to 1/32 of a 60 Hz frame
-constexpr float MIN_STEP_H = 1.f / 32.f;         // up to 1920 ticks/s
-constexpr float MAX_STEP_H = 2.f;
+constexpr float MIN_STEP_H = 1e-4f;            // preserve the actual engine delta; no artificial tick quantisation
+constexpr float MAX_STEP_H = 3.f;                 // dt > 0.05 s is rejected by botStep below
 constexpr float DIV_TOL = 0.8f;
 constexpr float DIV_COOLDOWN_FRAMES = 6.f;
 constexpr float WALL_SLACK = 90.f;
@@ -392,6 +391,9 @@ struct Searcher {
 		uint64_t h = 1469598103934665603ull;
 		auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
 		mix((uint32_t)t);
+		// X is not always implied by t: different portal histories can produce different
+		// horizontal positions even when the current speed and vertical state match.
+		mix((uint32_t)(int32_t)std::lround(s.x * 2.f));
 		mix((uint32_t)(int32_t)std::lround(s.y * 2.f));
 		mix((uint32_t)(int32_t)std::lround(s.vy * 10.f));
 		mix((s.ground ? 1u : 0u) | (s.sgn > 0.f ? 2u : 0u) | (s.held ? 4u : 0u));
@@ -869,8 +871,10 @@ static float uncertainty() {
 	return std::min(u, 3.5f);
 }
 
-static void releaseBtn(GJBaseGameLayer* gl) {
-	if (!G.holding) return;
+static void releaseBtn(GJBaseGameLayer* gl, bool force = false) {
+	// On reset/death/quit, send an explicit release even if our local flag is already
+	// false. This repairs a possible local/game input-state desynchronisation.
+	if (!G.holding && !force) return;
 	G.holding = false;
 	gl->handleButton(false, 1, true);
 }
@@ -906,11 +910,16 @@ static void resetTracking() {
 }
 
 // Called at the start of every tick: did the last press really produce a jump?
-static void inputConfirm(GJBaseGameLayer* gl, float vN, float h) {
+static void inputConfirm(GJBaseGameLayer* gl, PlayerObject* p, float vN, float h) {
 	auto& in = G.in;
 	if (in.st != J_SENT) return;
 	long age = in.tick - in.sentTick;   // 1 = first tick after the tick that sent the press
-	bool jumped = in.sentAir ? (vN > in.vBefore + 2.5f) : (vN > 4.f);
+	// A ground press is only confirmed when the player is actually airborne and
+	// moving upward. This avoids counting a positive velocity while still grounded.
+	// The upper bound also helps distinguish an ordinary jump from a nearby strong pad.
+	bool jumped = in.sentAir
+		? (vN > in.vBefore + 2.5f)
+		: (!p->m_isOnGround && vN > 4.f && vN < G.ph.jump + 2.f);
 	if (jumped) {
 		in.st = J_CONFIRMED;
 		in.confirmTick = in.tick;
@@ -1013,6 +1022,11 @@ static void buildEnv(Env& env, Sim& s0, float px, float h, int Hs, float limitX)
 			if (slot < 64) {
 				o.ix = slot++;
 				if (o.used) s0.mask |= 1ull << o.ix;
+			} else {
+				// The simulator's consumed-object mask is 64 bits. Never silently ignore
+				// additional interactive objects: treat overflow as a conservative hazard.
+				o.k = K_HAZARD;
+				o.ix = -1;
 			}
 		}
 		env.maxW = std::max(env.maxW, o.r.x1 - o.r.x0);
@@ -1026,6 +1040,12 @@ static void buildEnv(Env& env, Sim& s0, float px, float h, int Hs, float limitX)
 static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 	if (++C.age >= 240) refreshCfg();
 	auto p = pl->m_player1;
+	if (!p) {
+		G.active = false;
+		releaseBtn(gl, true);
+		resetTracking();
+		return;
+	}
 
 	bool on = C.enabled;
 	if (C.practiceOnly && !pl->m_isPracticeMode) on = false;
@@ -1048,7 +1068,7 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 	++G.in.tick;
 	++G.ticks;
 	float hRaw = dt * 60.f;
-	float h = std::clamp(std::round(hRaw * STEP_QUANT) / STEP_QUANT, MIN_STEP_H, MAX_STEP_H);
+	float h = std::clamp(hRaw, MIN_STEP_H, MAX_STEP_H);
 	G.lastH = h;
 	bool fresh = G.prevX < 0.f;
 
@@ -1083,7 +1103,7 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 
 	// ---- did the last press really register? ----------------------------------
 	G.reason = R_NONE;
-	if (!fresh) inputConfirm(gl, vN, h);
+	if (!fresh) inputConfirm(gl, p, vN, h);
 
 	// ---- prediction audit + divergence classification ---------------------------
 	if (G.sinceDiv < 1000000) ++G.sinceDiv;
@@ -1525,19 +1545,19 @@ class $modify(BotPlay, PlayLayer) {
 	}
 
 	void onQuit() {
+		releaseBtn(this, true);
 		G.debug = nullptr;
 		G.pathNode = nullptr;
 		G.trailNode = nullptr;
 		G.hud = nullptr;
 		G.plan = Plan();
 		G.prevX = -1.f;
-		releaseBtn(this);
 		PlayLayer::onQuit();
 	}
 
 	void resetLevel() {
-		// Never carry a held button across a respawn: a stale "down" would swallow the next press edge.
-		releaseBtn(this);
+		// Never carry a held button across a respawn; force a game-side release too.
+		releaseBtn(this, true);
 		PlayLayer::resetLevel();
 		for (auto& o : G.objs) o.used = false;
 		for (auto& ex : G.exps) ex.fired = false;
@@ -1568,7 +1588,7 @@ class $modify(BotPlay, PlayLayer) {
 		PlayLayer::destroyPlayer(player, object);
 		// Only count it if the player really died (GD calls this for harmless start-spike touches too).
 		if (player == m_player1 && !wasDead && m_player1->m_isDead && G.active && C.enabled) {
-			releaseBtn(this);
+			releaseBtn(this, true);
 			onDeath(object);
 		}
 	}
