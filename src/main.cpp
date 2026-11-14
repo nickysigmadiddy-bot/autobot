@@ -8,29 +8,29 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace geode::prelude;
 
 // ===========================================================================
-// AutoBot v0.6.2 - cube only, step-aligned, exact search, committed plans.
-// v0.6.2: planning wall / horizon only safe once landed, decision-level
-// learning (bans), real-death-only counting, start spike filtered, death
-// forensics, perf profiler, smooth 60 Hz path overlay.
+// AutoBot v0.7.0 - cube only. Click timing rewrite:
+//  * every click is placed in the middle of its safe window (not the late edge)
+//  * click latency is measured and simulated
+//  * timing bias is learned from deaths (rising death = too late, falling = too early)
+//  * no-path retry with exact hitboxes, keep old plan when the search times out
 // ===========================================================================
 
 constexpr float BASE_SPEED = 311.58f;
-constexpr double SEARCH_MS_FULL = 2.0;
+constexpr double SEARCH_MS_FULL = 3.5;
 constexpr double SEARCH_MS_DEADEND = 1.0;
 constexpr float DIV_TOL = 0.8f;
 constexpr int DIV_COOLDOWN = 24;
 constexpr float MIN_PLAN_H = 0.25f;     // 240 steps per second at most
-constexpr float WALL_SLACK = 90.f;      // units past an unsupported object we keep simulating while airborne
-constexpr int SETTLE_STEPS = 60;        // extra steps allowed past the horizon to land
-constexpr float BAN_TOL_X = 0.6f;
-constexpr float BAN_TOL_Y = 0.6f;
-constexpr size_t MAX_BANS = 96;
-constexpr int DEC_RING = 1024;
+constexpr float WALL_SLACK = 90.f;
+constexpr int SETTLE_STEPS = 60;
+constexpr int LEAD_OPEN = 12;           // steps of lead before the late edge when the window is already open
+constexpr int MAX_BIAS = 16;
 namespace phys {
 	constexpr float HALF = 15.f;
 	constexpr float GRAVITY = 0.864f;
@@ -92,9 +92,6 @@ static inline bool hit(Rc const& a, Rc const& b) {
 	return a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
 }
 
-// A learned "never do this here" rule: at world position (x, y) do not take action act (0 wait, 1 click).
-struct Ban { float x, y; uint8_t act; };
-
 enum Kind : uint8_t { K_SOLID, K_HAZARD, K_ORB, K_PAD, K_PORTAL };
 
 struct Obj {
@@ -147,7 +144,8 @@ struct Sim {
 	float sgn = 1.f;
 	float speed = BASE_SPEED;
 	bool ground = false;
-	bool held = false;
+	bool held = false;     // effective (already applied) button state
+	uint8_t q = 0;         // last decided actions, bit0 = newest (for click latency)
 	uint64_t mask = 0;
 };
 
@@ -160,7 +158,7 @@ struct Env {
 	float h = 0.25f;
 	float limitX = 1e9f;
 	bool useOrbs = true;
-	std::vector<Ban> const* forbid = nullptr;   // sorted by x
+	int lat = 0;           // click latency in planning steps (0..3)
 };
 
 static inline Rc box(Sim const& s, float h) {
@@ -191,17 +189,20 @@ static void applyPortal(Sim& s, int id) {
 	}
 }
 
+// 'press' is the DECIDED action this step. It becomes effective e.lat steps later.
 static bool stepFrame(Sim& s, bool press, Env const& e) {
 	using namespace phys;
-	bool edge = press && !s.held;
-	s.held = press;
+	s.q = (uint8_t)(((s.q << 1) | (press ? 1u : 0u)) & 0xFu);
+	bool eff = ((s.q >> e.lat) & 1u) != 0u;
+	bool edge = eff && !s.held;
+	s.held = eff;
 	float h = e.h;
 
 	s.x += s.speed * (h / 60.f);
 	float py = s.y;
 	bool canJump = s.ground;
 	s.ground = false;
-	if (canJump && press) s.vy = JUMP;
+	if (canJump && eff) s.vy = JUMP;
 	s.vy = std::max(s.vy - GRAVITY * h, -FALL_MAX);
 	s.y += s.vy * h * POS_SCALE;
 
@@ -271,20 +272,6 @@ static bool touchingOrb(Sim const& s, Env const& e) {
 	return false;
 }
 
-// False if a learned ban forbids this action in this exact state.
-static bool canAct(Sim const& s, Env const& e, bool press) {
-	if (!e.forbid || e.forbid->empty()) return true;
-	float wy = s.y * s.sgn;
-	uint8_t a = press ? 1 : 0;
-	auto const& v = *e.forbid;
-	auto it = std::lower_bound(v.begin(), v.end(), s.x - BAN_TOL_X,
-		[](Ban const& b, float x) { return b.x < x; });
-	for (; it != v.end() && it->x < s.x + BAN_TOL_X; ++it) {
-		if (it->act == a && std::abs(wy - it->y) < BAN_TOL_Y) return false;
-	}
-	return true;
-}
-
 // A click can only matter if some non-portal object is close enough ahead.
 static bool pressRelevant(Sim const& s, Env const& e) {
 	for (size_t i = firstIdx(e, s.x); i < e.loc.size(); ++i) {
@@ -347,15 +334,16 @@ struct Searcher {
 	int bestT = -1;
 	std::vector<uint8_t> bestPath;
 
-	static uint64_t keyOf(Sim const& s, int t) {
+	uint64_t keyOf(Sim const& s, int t) const {
 		uint64_t h = 1469598103934665603ull;
 		auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
 		mix((uint32_t)t);
 		mix((uint32_t)(int32_t)std::lround(s.y * 2.f));
 		mix((uint32_t)(int32_t)std::lround(s.vy * 10.f));
-		mix((s.ground ? 1u : 0u) | (s.sgn > 0.f ? 2u : 0u));
+		mix((s.ground ? 1u : 0u) | (s.sgn > 0.f ? 2u : 0u) | (s.held ? 4u : 0u));
 		mix(s.mask);
 		mix((uint32_t)(int32_t)std::lround(s.speed));
+		mix((uint32_t)(s.q & ((1u << e->lat) - 1u)));
 		return h;
 	}
 
@@ -372,8 +360,7 @@ struct Searcher {
 	bool dfs(Sim s, int t) {
 		size_t base = path.size();
 		for (;;) {
-			// A plan only counts as safe once the cube has landed (or after a generous settle window),
-			// so we never "succeed" while falling toward a spike just past the end.
+			// A plan only counts as safe once the cube has landed (or after a generous settle window).
 			if (t >= H && (s.ground || t >= H + SETTLE_STEPS)) return true;
 			if (s.x >= e->limitX && (s.ground || s.x >= e->limitX + WALL_SLACK)) return true;
 			if (t > bestT) { bestT = t; bestPath = path; }
@@ -392,12 +379,12 @@ struct Searcher {
 			if (dead.has(k)) { path.resize(base); return false; }
 
 			Sim w = s;
-			if (canAct(s, *e, false) && stepFrame(w, false, *e)) {
+			if (stepFrame(w, false, *e)) {
 				path.push_back(0);
 				if (dfs(w, t + 1)) return true;
 				path.pop_back();
 			}
-			if (!timeUp && canAct(s, *e, true) && (orb || pressRelevant(s, *e))) {
+			if (!timeUp && (orb || pressRelevant(s, *e))) {
 				Sim p = s;
 				if (stepFrame(p, true, *e)) {
 					path.push_back(1);
@@ -421,50 +408,91 @@ struct Plan {
 	bool clipped = false;
 	bool timedOut = false;
 	long nodes = 0;
+	// first click's safe window, for diagnostics (in planning steps from plan start)
+	int winMin = -1, winMax = -1, winPick = -1;
+	bool winBounded = false;
 };
 
-static void makePlan(Sim const& s0, Env const& e, int H, long budget, double msLimit, Plan& out) {
+// The DFS finds the LATEST click that survives (it always waits first). That is the edge of the
+// safe window, one step of error from death. Here every click (up to 3 per plan) is moved to the
+// middle of its own window, then the rest of the plan is searched again from there.
+static void makePlan(Sim const& s0, Env const& e, int H, long budget, double msLimit, int bias, Plan& out) {
 	static Searcher S;
 	S.e = &e; S.H = H; S.budget = budget; S.nodes = 0; S.timeUp = false;
 	S.msLimit = msLimit;
 	S.t0 = Clock::now();
 	S.dead.clear(); S.path.clear(); S.bestT = -1; S.bestPath.clear();
 
+	out.winMin = out.winMax = out.winPick = -1;
+	out.winBounded = false;
+
 	bool ok = S.dfs(s0, 0);
-	std::vector<uint8_t> acts = ok ? S.path : S.bestPath;
+	std::vector<uint8_t> cur = ok ? S.path : S.bestPath;
 
 	if (ok && !S.timeUp) {
-		auto it = std::find(acts.begin(), acts.end(), (uint8_t)1);
-		if (it != acts.end()) {
-			int p0 = (int)(it - acts.begin());
+		auto isStart = [&](size_t i) {
+			uint8_t prev = (i == 0) ? (uint8_t)(s0.q & 1u) : cur[i - 1];
+			return cur[i] == 1 && prev == 0;
+		};
+		size_t from = 0;
+		for (int iter = 0; iter < 3 && !S.timeUp; ++iter) {
+			int p0 = -1;
+			for (size_t i = from; i < cur.size(); ++i) {
+				if (isStart(i)) { p0 = (int)i; break; }
+			}
+			if (p0 < 0) break;
+
 			std::vector<Sim> pre;
 			pre.reserve((size_t)p0);
 			Sim s = s0;
-			for (int i = 0; i < p0; ++i) { pre.push_back(s); stepFrame(s, false, e); }
-			int back = std::max(1, (int)(8.f / e.h));
+			for (int i = 0; i < p0; ++i) { pre.push_back(s); stepFrame(s, cur[i] == 1, e); }
+
+			// Walk the click earlier, one step at a time, while the plan still survives.
+			int back = std::max(1, (int)(10.f / e.h));
+			int lo = std::max((int)from, p0 - back);
 			int cmin = p0;
-			for (int c = p0 - 1; c >= 0 && c >= p0 - back; --c) {
+			bool bounded = false;   // true = we found the real start of the window
+			for (int c = p0 - 1; c >= lo; --c) {
 				Sim const& st = pre[c];
-				if (!(st.ground || touchingOrb(st, e)) || !canAct(st, e, true)) break;
+				if (!(st.ground || touchingOrb(st, e))) { bounded = true; break; }
 				Sim q = st;
-				if (!stepFrame(q, true, e)) break;
-				S.path.assign(c, 0);
+				if (!stepFrame(q, true, e)) { bounded = true; break; }
+				S.path.assign(cur.begin(), cur.begin() + c);
 				S.path.push_back(1);
-				if (S.dfs(q, c + 1)) cmin = c; else break;
-				if (S.timeUp) break;
-			}
-			int c = (cmin + p0) / 2;
-			if (cmin < p0 && c != p0 && !S.timeUp) {
-				Sim q = pre[c];
-				if (canAct(q, e, true) && stepFrame(q, true, e)) {
-					S.path.assign(c, 0);
-					S.path.push_back(1);
-					if (S.dfs(q, c + 1)) acts = S.path;
+				if (S.dfs(q, c + 1)) {
+					cmin = c;
+				} else {
+					if (!S.timeUp) bounded = true;
+					break;
 				}
 			}
+			if (S.timeUp) break;
+
+			int width = p0 - cmin;
+			int off = std::clamp(bias, -(width / 4), width / 4);
+			int target;
+			if (width == 0)    target = p0;
+			else if (bounded)  target = (cmin + p0) / 2 - off;          // middle of the window
+			else               target = p0 - LEAD_OPEN - off;           // window already open: keep a lead
+			target = std::clamp(target, cmin, p0);
+
+			if (iter == 0) {
+				out.winMin = cmin; out.winMax = p0; out.winPick = target; out.winBounded = bounded;
+			}
+
+			if (target != p0) {
+				Sim q = pre[target];
+				if (stepFrame(q, true, e)) {
+					S.path.assign(cur.begin(), cur.begin() + target);
+					S.path.push_back(1);
+					if (S.dfs(q, target + 1)) cur = S.path;
+				}
+			}
+			from = (size_t)target + 1;
 		}
 	}
 
+	std::vector<uint8_t> acts = cur;
 	out.acts = acts;
 	out.px.clear(); out.py.clear();
 	out.px.reserve(acts.size()); out.py.reserve(acts.size());
@@ -487,15 +515,14 @@ static void makePlan(Sim const& s0, Env const& e, int H, long budget, double msL
 // Bot state
 // ===========================================================================
 struct Rec { float x, y, vN, predY, err; bool gr, act; };
-struct Dec { float x, y; uint8_t act; };
 
 struct Perf {
-	double stepUsSum = 0.0, stepUsMax = 0.0;      // our bot code per physics step
-	double gameUsSum = 0.0, gameUsMax = 0.0;      // the game's own processCommands (all mods)
+	double stepUsSum = 0.0, stepUsMax = 0.0;
+	double gameUsSum = 0.0, gameUsMax = 0.0;
 	long steps = 0;
 	double planMsSum = 0.0, planMsMax = 0.0;
 	long plans = 0;
-	double uiUsSum = 0.0, uiUsMax = 0.0;          // HUD + overlay + perf per render frame
+	double uiUsSum = 0.0, uiUsMax = 0.0;
 	long frames = 0;
 	Clock::time_point winStart{};
 };
@@ -522,23 +549,28 @@ struct Bot {
 	int sinceDiv = 1000000;
 	bool forceReplan = false;
 	int cool = 0;
+	int noReplan = 0;
+
+	// click timing
+	int lat = 0;                 // measured click latency in planning steps
+	int latCnt[4] = {0, 0, 0, 0};
+	int latWait = 0, latAge = 0;
+	uint8_t qHist = 0;           // last decided actions, bit0 = newest
+	int bias = 0;                // learned: >0 click earlier, <0 click later (steps)
 
 	float floorY = 90.f, ceilY = 390.f;
 	bool ceilLearned = false;
 
 	Rec ring[48];
 	int ringN = 0;
-	Dec decs[DEC_RING];
-	int decN = 0;
 	int sincePress = 1000000;
 	float pressX = 0.f, pressY = 0.f;
-	std::vector<Ban> bans;
 
 	double lastMs = 0.0, maxMs = 0.0;
 	int aheadId = -1, aheadDist = 0;
 
-	CCDrawNode* debug = nullptr;      // static objects (rebuilt after a new plan)
-	CCDrawNode* pathNode = nullptr;   // remaining planned path (rebuilt up to 60x/s)
+	CCDrawNode* debug = nullptr;
+	CCDrawNode* pathNode = nullptr;
 	CCLabelBMFont* hud = nullptr;
 	bool active = false;
 	char const* modeStr = "cube";
@@ -550,18 +582,6 @@ struct Bot {
 	double stepAvgUs = 0.0;
 };
 static Bot G;
-
-static bool banExists(float x, float y, uint8_t act) {
-	for (auto const& b : G.bans) {
-		if (b.act == act && std::abs(b.x - x) < 0.05f && std::abs(b.y - y) < 0.05f) return true;
-	}
-	return false;
-}
-static void addBan(float x, float y, uint8_t act) {
-	if (G.bans.size() >= MAX_BANS) G.bans.erase(G.bans.begin());
-	G.bans.push_back({x, y, act});
-	std::sort(G.bans.begin(), G.bans.end(), [](Ban const& a, Ban const& b) { return a.x < b.x; });
-}
 
 static void releaseBtn(GJBaseGameLayer* gl) {
 	if (!G.holding) return;
@@ -583,9 +603,9 @@ static void setHold(GJBaseGameLayer* gl, bool want, PlayerObject* p) {
 
 static void resetTracking() {
 	G.prevX = -1.f; G.havePred = false; G.plan.valid = false; G.sinceTick = 0.f;
+	G.qHist = 0; G.latWait = 0;
 }
 
-// Logs one line every 5 s so we can see where frame time really goes.
 static void perfTick(Clock::time_point now) {
 	auto& P = G.perf;
 	if (P.winStart.time_since_epoch().count() == 0) { P.winStart = now; return; }
@@ -640,6 +660,7 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 	auto pos = p->getPosition();
 	float sgn = p->m_isUpsideDown ? -1.f : 1.f;
 	if (G.cool > 0) --G.cool;
+	if (G.noReplan > 0) --G.noReplan;
 	if (G.plan.valid && std::abs(G.planH - h) > 0.01f) G.forceReplan = true;
 
 	// ---- telemetry --------------------------------------------------------
@@ -691,10 +712,41 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 	}
 	G.havePred = false;
 
+	// ---- measure click latency: decision tick -> visible jump velocity ---------
+	if (G.latWait) {
+		++G.latAge;
+		if (vN > 5.f) {
+			int meas = G.latAge - 1;
+			G.latWait = 0;
+			if (meas >= 0 && meas <= 3) {
+				++G.latCnt[meas];
+				int best = 0;
+				for (int i = 1; i < 4; ++i) {
+					if (G.latCnt[i] > G.latCnt[best]) best = i;
+				}
+				if (best != G.lat) {
+					G.lat = best;
+					G.forceReplan = true;
+					log::info("[AutoBot] click latency is now {} step(s) (samples: {} / {} / {} / {})",
+						G.lat, G.latCnt[0], G.latCnt[1], G.latCnt[2], G.latCnt[3]);
+				}
+			}
+		} else if (G.latAge >= 6) {
+			G.latWait = 0;
+		}
+	}
+
 	// ---- learn floor / ceiling ----------------------------------------------
 	auto solidIn = [&](Rc q) {
 		for (auto it = lowerBoundX(G.objs, pos.x - 200.f); it != G.objs.end() && it->r.x0 < pos.x + 40.f; ++it) {
 			if (it->k == K_SOLID && hit(q, it->r)) return true;
+		}
+		return false;
+	};
+	auto padOrOrbNear = [&]() {
+		Rc q{pos.x - 40.f, pos.y - 40.f, pos.x + 40.f, pos.y + 40.f};
+		for (auto it = lowerBoundX(G.objs, pos.x - 100.f); it != G.objs.end() && it->r.x0 < pos.x + 60.f; ++it) {
+			if ((it->k == K_PAD || it->k == K_ORB) && hit(q, it->r)) return true;
 		}
 		return false;
 	};
@@ -744,9 +796,14 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 	bool need = !G.plan.valid || G.forceReplan || fresh ||
 	            (G.plan.full ? remaining <= (size_t)(Hs / 2) : remaining == 0);
 	if (G.plan.valid && G.plan.clipped && !G.forceReplan && !fresh && remaining > 0) need = false;
+	if (G.noReplan > 0 && G.plan.valid && !G.forceReplan && !fresh) need = false;
 
 	if (need) {
 		bool wasFull = G.plan.valid && G.plan.full;
+		bool keepable = wasFull && remaining > 0 && !G.forceReplan && !fresh;
+		Plan backup;
+		if (keepable) backup = G.plan;
+
 		Env& env = G.dbgEnv;
 		env.loc.clear();
 		env.maxW = 30.f;
@@ -756,11 +813,13 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 		env.useOrbs = C.useOrbs;
 		env.h = h;
 		env.limitX = limitX;
-		env.forbid = &G.bans;
+		env.lat = G.lat;
 
 		Sim s0;
 		s0.x = pos.x; s0.sgn = sgn; s0.y = pos.y * sgn; s0.vy = vN;
-		s0.speed = G.speed; s0.ground = p->m_isOnGround; s0.held = G.holding;
+		s0.speed = G.speed; s0.ground = p->m_isOnGround;
+		s0.q = G.qHist;
+		s0.held = ((G.qHist >> G.lat) & 1u) != 0u;
 
 		float reachX = G.speed * (H / 60.f) + 90.f + (SETTLE_STEPS * h / 60.f) * G.speed;
 		int slot = 0;
@@ -779,7 +838,27 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 
 		double lim = (fresh || wasFull || !G.plan.valid) ? SEARCH_MS_FULL : SEARCH_MS_DEADEND;
 		auto t0 = Clock::now();
-		makePlan(s0, env, Hs, C.budget, lim, G.plan);
+		makePlan(s0, env, Hs, C.budget, lim, G.bias, G.plan);
+
+		// No survivable path with the safety margin: try again with exact hitboxes before giving up.
+		if (!G.plan.full && !G.plan.timedOut && env.margin > 0.f) {
+			env.margin = 0.f;
+			makePlan(s0, env, Hs, C.budget, SEARCH_MS_DEADEND, G.bias, G.plan);
+			static int retryLogs = 0;
+			if (G.plan.full && retryLogs < 5) {
+				++retryLogs;
+				log::info("[AutoBot] no safe path with margin at x={}, but one exists with exact hitboxes: using it", (double)pos.x);
+			}
+		}
+
+		// The search ran out of time and found nothing: the old plan is still better than guessing.
+		if (keepable && !G.plan.full && G.plan.timedOut) {
+			G.plan = std::move(backup);
+			G.noReplan = 12;
+		} else if (!G.plan.full) {
+			G.noReplan = 3;
+		}
+
 		G.lastMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 		G.maxMs = std::max(G.maxMs, G.lastMs);
 		G.perf.planMsSum += G.lastMs;
@@ -813,12 +892,14 @@ static void botStep(GJBaseGameLayer* gl, PlayLayer* pl, float dt) {
 		predNY = G.predY;
 		G.havePred = true;
 	}
+	bool wasHolding = G.holding;
 	setHold(gl, act, p);
+	G.qHist = (uint8_t)(((G.qHist << 1) | (act ? 1u : 0u)) & 0xFu);
 
-	// Remember every decision made while standing on something (the only time there is a real choice).
-	if (p->m_isOnGround) {
-		G.decs[G.decN % DEC_RING] = {pos.x, pos.y, (uint8_t)(act ? 1 : 0)};
-		++G.decN;
+	// Arm a latency measurement on clean ground clicks (not near pads/orbs).
+	if (act && !wasHolding && p->m_isOnGround && std::abs(vN) < 0.5f && !G.latWait && !padOrOrbNear()) {
+		G.latWait = 1;
+		G.latAge = 0;
 	}
 
 	Rec& r = G.ring[G.ringN % 48];
@@ -872,11 +953,11 @@ class $modify(BotPlay, PlayLayer) {
 
 		G.objs.clear();
 		G.unsup.clear();
-		G.bans.clear();
 		G.plan = Plan();
 		G.floorY = 90.f; G.ceilY = 390.f; G.ceilLearned = false;
 		G.sinceTick = 0.f;
-		G.decN = 0; G.sinceDiv = 1000000; G.divLogged = 0;
+		G.sinceDiv = 1000000; G.divLogged = 0;
+		G.bias = 0; G.qHist = 0; G.latWait = 0; G.noReplan = 0;
 		G.perf = Perf();
 		G.dbgEnv.loc.reserve(512);
 
@@ -922,7 +1003,7 @@ class $modify(BotPlay, PlayLayer) {
 		this->addChild(G.hud, 1000);
 		G.lastHud.clear();
 
-		log::info("[AutoBot] v0.6.2 ready: {} objects, {} unsupported, {} start hazards ignored. Planning at <=240 steps/s.",
+		log::info("[AutoBot] v0.7.0 ready: {} objects, {} unsupported, {} start hazards ignored. Planning at <=240 steps/s.",
 			G.objs.size(), G.unsup.size(), skippedStart);
 	}
 
@@ -948,9 +1029,11 @@ class $modify(BotPlay, PlayLayer) {
 		G.sinceDiv = 1000000;
 		G.err = 0.f;
 		G.cool = 0;
+		G.noReplan = 0;
 		G.sinceTick = 0.f;
 		G.sincePress = 1000000;
-		G.decN = 0;
+		G.qHist = 0;
+		G.latWait = 0;
 		++G.drawVer;
 	}
 
@@ -976,14 +1059,15 @@ class $modify(BotPlay, PlayLayer) {
 		}
 
 		++G.deaths;
+		bool simSawDoom = G.plan.valid && !G.plan.full;
 		char const* cls;
-		if (G.plan.valid && !G.plan.full)  cls = "PLANNER DEAD END (sim saw no survivable path)";
+		if (simSawDoom)                    cls = "PLANNER DEAD END (sim saw no survivable path)";
 		else if (G.sinceDiv < 120)         cls = "MODEL ERROR (sim diverged shortly before death)";
-		else                               cls = "UNSEEN (plan was clean: unmodelled object/hitbox)";
+		else                               cls = "UNSEEN (plan was clean: timing, hitbox or unmodelled object)";
 
 		int kid = killer ? killer->m_objectID : -1;
 		Rc kr{0.f, 0.f, 0.f, 0.f};
-		int knownKind = -1;   // -1 = the sim does not know this object at all; 0 solid, 1 hazard, 2 orb, 3 pad, 4 portal
+		int knownKind = -1;   // -1 = sim does not know this object; 0 solid, 1 hazard, 2 orb, 3 pad, 4 portal
 		if (killer) {
 			kr = toRc(killer->getObjectRect());
 			for (auto it = lowerBoundX(G.objs, kr.x0 - 40.f); it != G.objs.end() && it->r.x0 < kr.x1 + 40.f; ++it) {
@@ -994,6 +1078,8 @@ class $modify(BotPlay, PlayLayer) {
 			}
 		}
 
+		float vLast = G.ringN > 0 ? G.ring[(G.ringN - 1) % 48].vN : 0.f;
+
 		auto now = Clock::now();
 		bool dump = std::chrono::duration<double>(now - G.lastDeathLogT).count() > 3.0;
 		log::info("[AutoBot] death #{} x={} y={} killerId={} speed={} class={} replans={} maxErr={} lastSearch={}ms",
@@ -1002,6 +1088,9 @@ class $modify(BotPlay, PlayLayer) {
 		log::info("[AutoBot]   killer rect=[{}, {}, {}, {}] simKnowsIt={} wallId={} wallDist={} planSteps={} planFull={} timedOut={}",
 			(double)kr.x0, (double)kr.y0, (double)kr.x1, (double)kr.y1, knownKind,
 			G.aheadId, G.aheadDist, G.plan.acts.size(), G.plan.full, G.plan.timedOut);
+		log::info("[AutoBot]   last click window=[{}..{}] bounded={} picked={} | ticksSinceClick={} vyAtDeath={} | latency={} bias={}",
+			G.plan.winMin, G.plan.winMax, G.plan.winBounded, G.plan.winPick,
+			G.sincePress, (double)vLast, G.lat, G.bias);
 
 		if (dump) {
 			G.lastDeathLogT = now;
@@ -1014,17 +1103,17 @@ class $modify(BotPlay, PlayLayer) {
 		}
 
 		if (!C.learn) return;
-		// Learning: blame the most recent ground decision that is not already banned and forbid
-		// that exact choice at that exact spot. The planner then has to find something else, and
-		// because it looks ahead, repeated bans push the fix back to the true cause.
-		int n = std::min(G.decN, DEC_RING);
-		for (int i = 1; i <= n; ++i) {
-			Dec const& d = G.decs[(G.decN - i) % DEC_RING];
-			if (banExists(d.x, d.y, d.act)) continue;
-			addBan(d.x, d.y, d.act);
-			log::info("[AutoBot] learned: never {} at x={} y={} (decision {} ground-ticks before death, {} bans total)",
-				d.act ? "click" : "wait", (double)d.x, (double)d.y, i, G.bans.size());
-			break;
+		// Timing learning: the sim thought it was safe, yet we died shortly after a click.
+		// Died while rising = clicked too late -> click earlier next time.
+		// Died while falling = clicked too early -> click later next time.
+		if (!simSawDoom && G.sincePress < 160) {
+			if (vLast > 1.f) {
+				G.bias = std::min(G.bias + 2, MAX_BIAS);
+				log::info("[AutoBot] learned: that click was too LATE -> clicking earlier (bias {})", G.bias);
+			} else if (vLast < -1.f) {
+				G.bias = std::max(G.bias - 2, -MAX_BIAS);
+				log::info("[AutoBot] learned: that click was too EARLY -> clicking later (bias {})", G.bias);
+			}
 		}
 	}
 
@@ -1046,12 +1135,12 @@ class $modify(BotPlay, PlayLayer) {
 		G.lastHudT = now;
 
 		char buf[256];
-		std::snprintf(buf, sizeof(buf), "AutoBot %s | %s%s | clk %d dth %d | plan %d%s | err %.2f/%.2f | %.1fms | bans %d | %.0fus/step",
+		std::snprintf(buf, sizeof(buf), "AutoBot %s | %s%s | clk %d dth %d | plan %d%s | err %.2f/%.2f | %.1fms | lat %d bias %d | %.0fus/step",
 			G.active ? "ON" : "OFF", G.modeStr, (G.active && !isCube(m_player1)) ? " (cube only)" : "",
 			G.clicks, G.deaths,
 			(int)(G.plan.valid ? G.plan.acts.size() - std::min(G.plan.idx, G.plan.acts.size()) : 0),
 			(G.plan.valid && !G.plan.full) ? " DEADEND" : "",
-			(double)G.err, (double)G.maxErr, G.lastMs, (int)G.bans.size(), G.stepAvgUs);
+			(double)G.err, (double)G.maxErr, G.lastMs, G.lat, G.bias, G.stepAvgUs);
 		std::string s = buf;
 		if (G.aheadId >= 0 && G.aheadDist < 600) {
 			char b2[64];
